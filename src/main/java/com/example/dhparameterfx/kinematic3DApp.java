@@ -50,32 +50,20 @@ public class kinematic3DApp extends Application {
     private boolean useCartesianTrajectory = true;
 
     // --- Persistent scene-graph containers ---
-    // jointsGroup holds the per-joint axis/link/highlight nodes. It is fully torn down and
-    // rebuilt only on STRUCTURAL changes (add/remove joint, preset load, selection change,
-    // manual slider edit). During animation playback we never touch it structurally - we only
-    // update the transforms of the nodes already inside it (see refreshJointTransforms()).
     private final Group jointsGroup = new Group();
     private final Group floorPlaneGroup = new Group();
     private final Group trailGroup = new Group();
 
-    // Node caches so the 60fps animation loop can update transforms in place instead of
-    // allocating new AxisGroup/Cylinder/Material objects every frame.
     private final List<AxisGroup> jointAxisNodes = new ArrayList<>();
     private final List<Cylinder> linkCylinderNodes = new ArrayList<>();
     private Node highlightBoxNode;
 
-    // Joint type tracking. IKSolver/TrajectoryPlanner (not visible to this file) only ever
-    // read/write theta, so this is tracked locally and kept in sync with dhModels at every
-    // mutation site (add/remove/preset/import). true = prismatic (driven by d), false =
-    // revolute (driven by theta).
     private final List<Boolean> jointIsPrismatic = new ArrayList<>();
 
-    /** Reads whichever DH variable is this joint's driven DOF (theta for revolute, d for prismatic). */
     private double getJointVar(int i) {
         return jointIsPrismatic.get(i) ? dhModels.get(i).getD() : dhModels.get(i).getTheta();
     }
 
-    /** Writes whichever DH variable is this joint's driven DOF (theta for revolute, d for prismatic). */
     private void setJointVar(int i, double value) {
         if (jointIsPrismatic.get(i)) {
             dhModels.get(i).dProperty().set(value);
@@ -84,19 +72,20 @@ public class kinematic3DApp extends Application {
         }
     }
 
-    // Floor / restriction-plane state
     private boolean showFloorPlane = true;
     private static final double FLOOR_EPSILON = 0.05;
 
-    // Planned-path trail state
+    private boolean showTransformBreakdown = false;
+    private VBox transformBreakdownPanel;
+    private Label breakdownStatusLabel;
+    private Label selfTestResultLabel;
+    private final Label[][] rzLabels = new Label[4][4];
+    private final Label[][] tzLabels = new Label[4][4];
+    private final Label[][] txLabels = new Label[4][4];
+    private final Label[][] rxLabels = new Label[4][4];
+
     private boolean showPlannedTrail = true;
 
-    /**
-     * Builds a visible restriction plane at Z = 0 (the "floor" the arm's joints must not dip
-     * below). Lives in the same local frame as the DH-computed joint positions, so it lines
-     * up exactly with the Z >= 0 constraint enforced elsewhere. Sized as a square of the given
-     * extent, with a light reference grid every {@code gridSpacing} units.
-     */
     private Node buildFloorPlane(double extent, double gridSpacing) {
         Group plane = new Group();
 
@@ -153,13 +142,10 @@ public class kinematic3DApp extends Application {
         robotGroup.getTransforms().add(new Rotate(270, Rotate.Z_AXIS));
         world.getChildren().add(robotGroup);
 
-        // Target Sphere
         targetSphere.setMaterial(new PhongMaterial(Color.web("#e06c75")));
         robotGroup.getChildren().add(targetSphere);
         updateTargetSpherePosition();
 
-        // Persistent containers: added ONCE. jointsGroup contents get rebuilt on structural
-        // changes; floorPlaneGroup/trailGroup are toggled via visibility, never torn down.
         floorPlaneGroup.getChildren().add(buildFloorPlane(30.0, 5.0));
         floorPlaneGroup.setVisible(showFloorPlane);
         floorPlaneGroup.setMouseTransparent(true);
@@ -169,7 +155,6 @@ public class kinematic3DApp extends Application {
 
         robotGroup.getChildren().addAll(floorPlaneGroup, trailGroup, jointsGroup);
 
-        // Lighting
         AmbientLight ambient = new AmbientLight(Color.color(0.4, 0.4, 0.4));
         PointLight pointLight = new PointLight(Color.WHITE);
         pointLight.setTranslateX(-20);
@@ -177,20 +162,22 @@ public class kinematic3DApp extends Application {
         pointLight.setTranslateZ(-50);
         world.getChildren().addAll(ambient, pointLight);
 
-        // Default 3-Joint Robot
         dhModels.add(new DHParameterModel(0.0, 90.0, 5.0, 30.0));
         dhModels.add(new DHParameterModel(10.0, 0.0, 0.0, 40.0));
         dhModels.add(new DHParameterModel(8.0, 0.0, 0.0, -25.0));
         jointIsPrismatic.addAll(List.of(false, false, false));
 
-        // Create HUD Overlay
         hud = new MatrixDisplayHUD();
+        transformBreakdownPanel = buildTransformBreakdownPanel();
+        transformBreakdownPanel.setVisible(showTransformBreakdown);
+        transformBreakdownPanel.setMouseTransparent(true);
 
-        // Layer SubScene and HUD using StackPane
         StackPane viewportPane = new StackPane();
-        viewportPane.getChildren().addAll(subScene, hud);
+        viewportPane.getChildren().addAll(subScene, hud, transformBreakdownPanel);
         StackPane.setAlignment(hud, Pos.TOP_LEFT);
         StackPane.setMargin(hud, new Insets(15));
+        StackPane.setAlignment(transformBreakdownPanel, Pos.BOTTOM_LEFT);
+        StackPane.setMargin(transformBreakdownPanel, new Insets(15));
 
         BorderPane root = new BorderPane();
         root.setCenter(viewportPane);
@@ -212,8 +199,10 @@ public class kinematic3DApp extends Application {
 
             if (current instanceof AxisGroup axis) {
                 Object tag = axis.getUserData();
-                if (tag instanceof Integer jointIdx) {
-                    selectedJointIndex = jointIdx;
+                if (tag instanceof Integer axisIdx) {
+                    // FIX: Map axisIdx (0..N) to joint index (0..N-1).
+                    // Axis 0 is the base, axis 1 is Joint 1 (index 0)
+                    selectedJointIndex = Math.max(0, axisIdx - 1);
                     rebuildUIControls();
                     updateRobot3D();
                 }
@@ -230,13 +219,277 @@ public class kinematic3DApp extends Application {
         primaryStage.show();
     }
 
+    private void runFullChainSelfTest() {
+        List<Matrix4x4> transforms = computeCurrentTransforms();
+        if (transforms.isEmpty() || dhModels.isEmpty()) {
+            selfTestResultLabel.setText("No joints to test.");
+            selfTestResultLabel.setStyle("-fx-text-fill: #abb2bf; -fx-font-size: 11px;");
+            return;
+        }
+
+        int numCandidates = buildCandidateSteps(0, 0, 0, 0).size();
+        double[] worstPerCandidate = new double[numCandidates];
+        int[] worstJointPerCandidate = new int[numCandidates];
+        String[] candidateNames = new String[numCandidates];
+
+        for (int i = 0; i < dhModels.size(); i++) {
+            DHParameterModel model = dhModels.get(i);
+            List<ConventionCandidate> candidates = buildCandidateSteps(model.getTheta(), model.getD(), model.getA(), model.getAlpha());
+
+            // FIX: Transforms size is N+1. Joint `i` defines the step between frame `i` and `i+1`.
+            double[][] prevCumulative = toArray(transforms.get(i));
+            double[][] currCumulative = toArray(transforms.get(i + 1));
+            double[][] actualStep = matMul4(invertRigid(prevCumulative), currCumulative);
+
+            for (int k = 0; k < candidates.size(); k++) {
+                candidateNames[k] = candidates.get(k).name;
+                double diff = maxDiff4(actualStep, candidates.get(k).matrix);
+                if (diff > worstPerCandidate[k]) {
+                    worstPerCandidate[k] = diff;
+                    worstJointPerCandidate[k] = i;
+                }
+            }
+        }
+
+        int bestCandidate = 0;
+        for (int k = 1; k < numCandidates; k++) {
+            if (worstPerCandidate[k] < worstPerCandidate[bestCandidate]) bestCandidate = k;
+        }
+
+        double bestDiff = worstPerCandidate[bestCandidate];
+
+        if (bestDiff < 1e-3) {
+            selfTestResultLabel.setText(String.format(
+                    "\u2713 All %d joint(s) consistently match: %s (max discrepancy %.5f)",
+                    dhModels.size(), candidateNames[bestCandidate], bestDiff));
+            selfTestResultLabel.setStyle("-fx-text-fill: #98c379; -fx-font-size: 11px; -fx-font-weight: bold;");
+        } else {
+            selfTestResultLabel.setText(String.format(
+                    "\u26A0 No tested convention fits the whole chain (closest: %s, worst joint %d off by %.3f)",
+                    candidateNames[bestCandidate], worstJointPerCandidate[bestCandidate] + 1, bestDiff));
+            selfTestResultLabel.setStyle("-fx-text-fill: #e5c07b; -fx-font-size: 11px; -fx-font-weight: bold;");
+        }
+    }
+
     private void updateTargetSpherePosition() {
         targetSphere.setTranslateX(targetPos[0]);
         targetSphere.setTranslateY(targetPos[1]);
         targetSphere.setTranslateZ(targetPos[2]);
     }
 
-    /** Computes the cumulative FK transforms for the DH chain's current pose. */
+    private VBox buildMatrixCard(String title, Label[][] labelRefs) {
+        Label header = new Label(title);
+        header.setStyle("-fx-text-fill: #61afef; -fx-font-weight: bold; -fx-font-size: 10px;");
+
+        GridPane grid = new GridPane();
+        grid.setHgap(5);
+        grid.setVgap(2);
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 4; c++) {
+                Label cell = new Label("0.00");
+                cell.setStyle("-fx-text-fill: #d0d0d0; -fx-font-family: monospace; -fx-font-size: 10px;");
+                cell.setMinWidth(42);
+                cell.setAlignment(Pos.CENTER_RIGHT);
+                grid.add(cell, c, r);
+                labelRefs[r][c] = cell;
+            }
+        }
+
+        VBox card = new VBox(3, header, grid);
+        card.setStyle("-fx-background-color: rgba(30,30,36,0.9); -fx-padding: 6; -fx-background-radius: 4;");
+        return card;
+    }
+
+    private VBox buildTransformBreakdownPanel() {
+        VBox rzCard = buildMatrixCard("Rot_z(\u03B8)", rzLabels);
+        VBox tzCard = buildMatrixCard("Trans_z(d)", tzLabels);
+        VBox txCard = buildMatrixCard("Trans_x(a)", txLabels);
+        VBox rxCard = buildMatrixCard("Rot_x(\u03B1)", rxLabels);
+
+        HBox matricesRow = new HBox(8, rzCard, tzCard, txCard, rxCard);
+
+        Label title = new Label("Elementary Transforms - Selected Joint");
+        title.setStyle("-fx-text-fill: white; -fx-font-weight: bold; -fx-font-size: 11px;");
+
+        breakdownStatusLabel = new Label();
+        breakdownStatusLabel.setWrapText(true);
+        breakdownStatusLabel.setMaxWidth(400);
+        breakdownStatusLabel.setStyle("-fx-font-size: 10px; -fx-font-weight: bold;");
+
+        VBox panel = new VBox(6, title, matricesRow, breakdownStatusLabel);
+        panel.setStyle("-fx-background-color: rgba(20,20,24,0.8); -fx-padding: 10; -fx-background-radius: 6;");
+        return panel;
+    }
+
+    private double[][] matMul4(double[][] A, double[][] B) {
+        double[][] R = new double[4][4];
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 4; c++) {
+                double sum = 0;
+                for (int k = 0; k < 4; k++) sum += A[r][k] * B[k][c];
+                R[r][c] = sum;
+            }
+        }
+        return R;
+    }
+
+    private double[][] rotZMatrix(double thetaDeg) {
+        double t = Math.toRadians(thetaDeg);
+        double c = Math.cos(t), s = Math.sin(t);
+        return new double[][]{{c, -s, 0, 0}, {s, c, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+    }
+
+    private double[][] rotXMatrix(double alphaDeg) {
+        double a = Math.toRadians(alphaDeg);
+        double c = Math.cos(a), s = Math.sin(a);
+        return new double[][]{{1, 0, 0, 0}, {0, c, -s, 0}, {0, s, c, 0}, {0, 0, 0, 1}};
+    }
+
+    private double[][] transZMatrix(double d) {
+        return new double[][]{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, d}, {0, 0, 0, 1}};
+    }
+
+    private double[][] transXMatrix(double a) {
+        return new double[][]{{1, 0, 0, a}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+    }
+
+    private double[][] rotYMatrix(double alphaDeg) {
+        double a = Math.toRadians(alphaDeg);
+        double c = Math.cos(a), s = Math.sin(a);
+        return new double[][]{{c, 0, s, 0}, {0, 1, 0, 0}, {-s, 0, c, 0}, {0, 0, 0, 1}};
+    }
+
+    private double[][] transYMatrix(double a) {
+        return new double[][]{{1, 0, 0, 0}, {0, 1, 0, a}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+    }
+
+    private static class ConventionCandidate {
+        final String name;
+        final double[][] matrix;
+        ConventionCandidate(String name, double[][] matrix) {
+            this.name = name;
+            this.matrix = matrix;
+        }
+    }
+
+    private List<ConventionCandidate> buildCandidateSteps(double theta, double d, double a, double alpha) {
+        double[][] rz = rotZMatrix(theta);
+        double[][] rzNeg = rotZMatrix(-theta);
+        double[][] tz = transZMatrix(d);
+        double[][] tx = transXMatrix(a);
+        double[][] rx = rotXMatrix(alpha);
+        double[][] rxNeg = rotXMatrix(-alpha);
+        double[][] ty = transYMatrix(a);
+        double[][] ry = rotYMatrix(alpha);
+
+        List<ConventionCandidate> list = new ArrayList<>();
+        list.add(new ConventionCandidate("Standard DH: Rz(\u03B8)\u00B7Tz(d)\u00B7Tx(a)\u00B7Rx(\u03B1)",
+                matMul4(matMul4(rz, tz), matMul4(tx, rx))));
+        list.add(new ConventionCandidate("Modified DH: Rx(\u03B1)\u00B7Tx(a)\u00B7Rz(\u03B8)\u00B7Tz(d)",
+                matMul4(matMul4(rx, tx), matMul4(rz, tz))));
+        list.add(new ConventionCandidate("Standard DH, \u03B8 sign flipped: Rz(-\u03B8)\u00B7Tz(d)\u00B7Tx(a)\u00B7Rx(\u03B1)",
+                matMul4(matMul4(rzNeg, tz), matMul4(tx, rx))));
+        list.add(new ConventionCandidate("Standard DH, \u03B1 sign flipped: Rz(\u03B8)\u00B7Tz(d)\u00B7Tx(a)\u00B7Rx(-\u03B1)",
+                matMul4(matMul4(rz, tz), matMul4(tx, rxNeg))));
+        list.add(new ConventionCandidate("Standard DH, twist on Y instead of X: Rz(\u03B8)\u00B7Tz(d)\u00B7Ty(a)\u00B7Ry(\u03B1)",
+                matMul4(matMul4(rz, tz), matMul4(ty, ry))));
+        return list;
+    }
+
+    private double maxDiff4(double[][] a, double[][] b) {
+        double worst = 0;
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 4; c++) {
+                worst = Math.max(worst, Math.abs(a[r][c] - b[r][c]));
+            }
+        }
+        return worst;
+    }
+
+    private double[][] identity4() {
+        return new double[][]{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+    }
+
+    private double[][] toArray(Matrix4x4 m) {
+        double[][] out = new double[4][4];
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 4; c++) {
+                out[r][c] = m.get(r, c);
+            }
+        }
+        out[3] = new double[]{0, 0, 0, 1};
+        return out;
+    }
+
+    private double[][] invertRigid(double[][] T) {
+        double[][] inv = new double[4][4];
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 3; c++) {
+                inv[r][c] = T[c][r];
+            }
+        }
+        for (int r = 0; r < 3; r++) {
+            double sum = 0;
+            for (int k = 0; k < 3; k++) sum += inv[r][k] * T[k][3];
+            inv[r][3] = -sum;
+        }
+        inv[3] = new double[]{0, 0, 0, 1};
+        return inv;
+    }
+
+    private void setGridValues(Label[][] labels, double[][] values) {
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 4; c++) {
+                labels[r][c].setText(String.format("%.2f", values[r][c]));
+            }
+        }
+    }
+
+    private void updateTransformBreakdown(List<Matrix4x4> transforms) {
+        if (!showTransformBreakdown || transforms.isEmpty()) return;
+
+        int idx = Math.max(0, Math.min(selectedJointIndex, dhModels.size() - 1));
+        DHParameterModel model = dhModels.get(idx);
+
+        double theta = model.getTheta(), d = model.getD(), a = model.getA(), alpha = model.getAlpha();
+
+        double[][] rz = rotZMatrix(theta);
+        double[][] tz = transZMatrix(d);
+        double[][] tx = transXMatrix(a);
+        double[][] rx = rotXMatrix(alpha);
+
+        setGridValues(rzLabels, rz);
+        setGridValues(tzLabels, tz);
+        setGridValues(txLabels, tx);
+        setGridValues(rxLabels, rx);
+
+        // FIX: Using the correct index for transforms frame steps.
+        double[][] prevCumulative = toArray(transforms.get(idx));
+        double[][] currCumulative = toArray(transforms.get(idx + 1));
+        double[][] actualStep = matMul4(invertRigid(prevCumulative), currCumulative);
+
+        List<ConventionCandidate> candidates = buildCandidateSteps(theta, d, a, alpha);
+        ConventionCandidate best = null;
+        double bestDiff = Double.MAX_VALUE;
+        for (ConventionCandidate c : candidates) {
+            double diff = maxDiff4(actualStep, c.matrix);
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                best = c;
+            }
+        }
+
+        if (bestDiff < 1e-3) {
+            breakdownStatusLabel.setText("\u2713 Matches: " + best.name + String.format(" (max discrepancy %.5f)", bestDiff));
+            breakdownStatusLabel.setStyle("-fx-text-fill: #98c379; -fx-font-size: 10px; -fx-font-weight: bold;");
+        } else {
+            breakdownStatusLabel.setText(String.format(
+                    "\u26A0 No tested convention matches this joint (closest: %s, off by %.3f)",
+                    best.name, bestDiff));
+            breakdownStatusLabel.setStyle("-fx-text-fill: #e5c07b; -fx-font-size: 10px; -fx-font-weight: bold;");
+        }
+    }
+
     private List<Matrix4x4> computeCurrentTransforms() {
         List<DHParameter> dhParams = new ArrayList<>();
         for (DHParameterModel model : dhModels) {
@@ -245,7 +498,6 @@ public class kinematic3DApp extends Application {
         return fkEngine.computeCumulativeTransforms(dhParams);
     }
 
-    /** True if any joint in the chain has dipped below the Z = 0 floor plane. */
     private boolean violatesFloor(List<Matrix4x4> transforms) {
         for (Matrix4x4 m : transforms) {
             if (m.getPosition()[2] < -FLOOR_EPSILON) return true;
@@ -253,25 +505,14 @@ public class kinematic3DApp extends Application {
         return false;
     }
 
-    /**
-     * Updates the HUD with the transform of the currently SELECTED joint (not always the
-     * end-effector), so the HUD actually functions as a DH-parameter checker: pick a joint,
-     * see the matrix that joint's (a, alpha, d, theta) row produces. Falls back to a valid
-     * index if the selection is stale (e.g. right after a joint was deleted).
-     */
     private void updateHudDisplay(List<Matrix4x4> transforms) {
         if (transforms.isEmpty() || hud == null) return;
-        int idx = Math.max(0, Math.min(selectedJointIndex, transforms.size() - 1));
-        hud.update(transforms.get(idx));
+        int idx = Math.max(0, Math.min(selectedJointIndex, dhModels.size() - 1));
+        // FIX: The frame belonging to this joint index is shifted by +1
+        hud.update(transforms.get(idx + 1));
+        updateTransformBreakdown(transforms);
     }
 
-    /**
-     * Draws a visible 3D trail through the workspace tracing the path the end-effector is
-     * about to take, BEFORE the arm moves. For Cartesian trajectories this is a straight line
-     * from the current end-effector position to the target. For joint-space trajectories the
-     * path is generally curved in Cartesian space, so we sample the interpolated joint
-     * trajectory at several points and connect the resulting end-effector positions.
-     */
     private void buildPlannedTrail(double[] qStart, double[] qEnd, double[] startPos) {
         trailGroup.getChildren().clear();
         Color trailColor = Color.web("#98c379", 0.85);
@@ -293,8 +534,6 @@ public class kinematic3DApp extends Application {
                 double[] p = transforms.get(transforms.size() - 1).getPosition();
                 samples.add(new Point3D(p[0], p[1], p[2]));
             }
-            // Restore the chain to its starting pose - the caller resets to qStart right after
-            // this returns, but we leave it consistent either way.
             for (int i = 0; i < dhModels.size(); i++) {
                 setJointVar(i, qStart[i]);
             }
@@ -305,7 +544,6 @@ public class kinematic3DApp extends Application {
             trailGroup.getChildren().add(segment);
         }
 
-        // A small marker sphere at the destination makes the endpoint of the plan unambiguous.
         Sphere endMarker = new Sphere(0.4);
         endMarker.setMaterial(new PhongMaterial(trailColor));
         Point3D lastPoint = samples.get(samples.size() - 1);
@@ -316,7 +554,6 @@ public class kinematic3DApp extends Application {
     }
 
     private void runIKAndAnimate() {
-        // Check basic workspace reachability
         if (!ikSolver.isTargetReachable(dhModels, targetPos)) {
             showWarningDialog("Unreachable Target",
                     String.format("The target position (%.1f, %.1f, %.1f) is beyond the robot's kinematic reach.",
@@ -324,63 +561,45 @@ public class kinematic3DApp extends Application {
             return;
         }
 
-        // 1. Capture starting configuration. qStart[i] holds theta for revolute joints, d for
-        // prismatic ones - the "driven DOF" per joint.
         double[] qStart = new double[dhModels.size()];
         for (int i = 0; i < dhModels.size(); i++) {
             qStart[i] = getJointVar(i);
         }
 
-        // 2. Solve IK (350 iterations, 0.1 tolerance). IKSolver now takes jointIsPrismatic
-        // directly, so it builds a proper Jacobian column (and applies updates) against d for
-        // prismatic joints and theta for revolute ones - no post-hoc undo or separate
-        // coordinate-descent pass needed anymore.
         boolean solved = ikSolver.solve(dhModels, targetPos, 350, 0.1, jointIsPrismatic);
 
         if (!solved) {
             showWarningDialog("Target Unreachable",
                     "The manipulator reached its limit towards the target, but could not match the exact position due to joint constraints.");
-            // Reset to start position and abort
             for (int i = 0; i < dhModels.size(); i++) {
                 setJointVar(i, qStart[i]);
             }
             return;
         }
 
-        // 3. Capture end configuration after the solver finishes successfully
         double[] qEnd = new double[dhModels.size()];
         for (int i = 0; i < dhModels.size(); i++) {
             qEnd[i] = getJointVar(i);
         }
 
-        // 4. Reset the models back to the start so we can animate from the beginning
         for (int i = 0; i < dhModels.size(); i++) {
             setJointVar(i, qStart[i]);
         }
 
-        // 5. Compute transforms at the starting pose to define startPos for the straight line
         List<Matrix4x4> startTransforms = computeCurrentTransforms();
         double[] startPos = startTransforms.get(startTransforms.size() - 1).getPosition();
 
-        // 6. Build the visible planned-path trail BEFORE any motion happens, so the user can
-        // see exactly where the arm is about to go.
         buildPlannedTrail(qStart, qEnd, startPos);
 
-        // dhModels may have been left mid-sample by buildPlannedTrail's joint-space preview;
-        // guarantee we're sitting at the start pose before animating.
         for (int i = 0; i < dhModels.size(); i++) {
             setJointVar(i, qStart[i]);
         }
 
-        // 7. Stop any existing animation
         if (playbackTimer != null) playbackTimer.stop();
 
-        // 8. Start the new animation timer
         final long startTime = System.nanoTime();
-        final double durationNs = 1_500_000_000.0; // 1.5 seconds
+        final double durationNs = 1_500_000_000.0;
 
-        // Tracks the last configuration that did NOT violate the floor, so a frame that would
-        // dip a joint below Z = 0 can be rejected without freezing the whole animation.
         final double[] lastGoodQ = qStart.clone();
 
         playbackTimer = new AnimationTimer() {
@@ -388,36 +607,22 @@ public class kinematic3DApp extends Application {
             public void handle(long now) {
                 double elapsed = now - startTime;
                 double tNorm = Math.max(0.0, Math.min(1.0, elapsed / durationNs));
-
-                // Smooth cubic easing s(t) = 3t^2 - 2t^3
                 double s = 3 * tNorm * tNorm - 2 * tNorm * tNorm * tNorm;
 
                 if (useCartesianTrajectory) {
-                    // CARTESIAN SPACE: Interpolate end-effector in a straight line
                     double[] currentTarget = new double[]{
                             startPos[0] + s * (targetPos[0] - startPos[0]),
                             startPos[1] + s * (targetPos[1] - startPos[1]),
-                            Math.max(0.0, startPos[2] + s * (targetPos[2] - startPos[2])) // Floor constraint
+                            Math.max(0.0, startPos[2] + s * (targetPos[2] - startPos[2]))
                     };
-
-                    // Run a quick 5-iteration IK to track the line on this frame. Now that
-                    // IKSolver understands jointIsPrismatic, this correctly drives d for
-                    // prismatic joints and theta for revolute ones, frame by frame - no manual
-                    // post-processing needed.
                     ikSolver.solve(dhModels, currentTarget, 5, 0.1, jointIsPrismatic);
                 } else {
-                    // JOINT SPACE: Interpolate the driven variable directly (theta for
-                    // revolute joints, d for prismatic ones)
                     double[] currentQ = TrajectoryPlanner.interpolateCubic(qStart, qEnd, tNorm);
                     for (int i = 0; i < dhModels.size(); i++) {
                         setJointVar(i, currentQ[i]);
                     }
                 }
 
-                // Floor enforcement: no joint (not just the end-effector) may dip below Z = 0.
-                // If this frame's solution violates that, roll back to the last good pose
-                // instead of applying it - the arm simply pauses at the floor boundary rather
-                // than clipping through it.
                 List<Matrix4x4> frameTransforms = computeCurrentTransforms();
                 if (violatesFloor(frameTransforms)) {
                     for (int i = 0; i < dhModels.size(); i++) {
@@ -429,9 +634,6 @@ public class kinematic3DApp extends Application {
                     }
                 }
 
-                // Fast path: update existing node transforms only. No geometry is allocated
-                // here, which is what makes 60fps playback smooth (including the very first
-                // move) instead of rebuilding the whole robot's mesh every frame.
                 refreshJointTransforms();
 
                 if (tNorm >= 1.0) {
@@ -471,7 +673,6 @@ public class kinematic3DApp extends Application {
             updateRobot3D();
         });
 
-        // Presets Toolbar
         Label presetsLabel = new Label("Presets:");
         presetsLabel.setStyle("-fx-font-size: 11px; -fx-text-fill: #abb2bf; -fx-font-weight: bold;");
 
@@ -489,7 +690,6 @@ public class kinematic3DApp extends Application {
         pumaBtn.setOnAction(e -> loadPuma560Preset());
         presetBar.getChildren().addAll(scaraBtn, pumaBtn);
 
-        // File I/O Toolbar
         Label fileLabel = new Label("File I/O:");
         fileLabel.setStyle("-fx-font-size: 11px; -fx-text-fill: #abb2bf; -fx-font-weight: bold;");
 
@@ -507,7 +707,6 @@ public class kinematic3DApp extends Application {
         importBtn.setOnAction(e -> importFromJson(primaryStage));
         fileBar.getChildren().addAll(exportBtn, importBtn);
 
-        // IK Target Controls Panel
         Label ikLabel = new Label("IK Target Workspace:");
         ikLabel.setStyle("-fx-font-size: 11px; -fx-text-fill: #abb2bf; -fx-font-weight: bold;");
 
@@ -539,8 +738,28 @@ public class kinematic3DApp extends Application {
             trailGroup.setVisible(newV);
         });
 
+        CheckBox breakdownToggle = new CheckBox("Show elementary transform breakdown");
+        breakdownToggle.setSelected(showTransformBreakdown);
+        breakdownToggle.setStyle("-fx-text-fill: #abb2bf; -fx-font-size: 11px;");
+        breakdownToggle.selectedProperty().addListener((o, oldV, newV) -> {
+            showTransformBreakdown = newV;
+            transformBreakdownPanel.setVisible(newV);
+            if (newV) {
+                updateTransformBreakdown(computeCurrentTransforms());
+            }
+        });
+
+        Button selfTestBtn = new Button("Run Self-Test (verify whole chain)");
+        selfTestBtn.setMaxWidth(Double.MAX_VALUE);
+        selfTestBtn.setStyle("-fx-background-color: #3b3b4d; -fx-text-fill: #abb2bf; -fx-font-size: 11px;");
+        selfTestBtn.setOnAction(e -> runFullChainSelfTest());
+
+        selfTestResultLabel = new Label();
+        selfTestResultLabel.setWrapText(true);
+        selfTestResultLabel.setMaxWidth(300);
+
         ikBox.getChildren().addAll(targetXRow, targetYRow, targetZRow, planMotionBtn,
-                floorPlaneToggle, trailToggle);
+                floorPlaneToggle, trailToggle, breakdownToggle, selfTestBtn, selfTestResultLabel);
 
         controlsContainer = new VBox(12);
         ScrollPane scrollPane = new ScrollPane(controlsContainer);
@@ -564,8 +783,6 @@ public class kinematic3DApp extends Application {
         lbl.setPrefWidth(65);
         lbl.setStyle("-fx-text-fill: #abb2bf; -fx-font-size: 11px;");
 
-        // Index 2 is the Z (height/floor) axis - the target ball can never be placed below
-        // the floor plane, so its slider and text input floor at 0 instead of -25.
         double minVal = (index == 2) ? 0.0 : -25.0;
         posArray[index] = Math.max(minVal, posArray[index]);
 
@@ -657,8 +874,6 @@ public class kinematic3DApp extends Application {
 
             cardHeader.getChildren().addAll(title, prismaticToggle, spacer, deleteBtn);
 
-            // Inside rebuildUIControls() method of Kinematic3DApp.java
-
             HBox limitsRow = new HBox(10);
             limitsRow.setAlignment(Pos.CENTER_LEFT);
 
@@ -710,7 +925,7 @@ public class kinematic3DApp extends Application {
                     cardHeader,
                     createSliderRow("a (Length):", -20, 20, model.aProperty(), false),
                     createSliderRow(dLabelText, -20, 20, model.dProperty(), false),
-                    dialsRow, // Replaced the two angle sliders with the dual rotary dials
+                    dialsRow,
                     limitsRow
             );
 
@@ -768,13 +983,6 @@ public class kinematic3DApp extends Application {
         return row;
     }
 
-    /**
-     * STRUCTURAL rebuild: tears down and recreates the per-joint 3D nodes (axis markers, link
-     * cylinders, selection highlight). This allocates new geometry, so it's only called on
-     * structural changes - adding/removing a joint, loading a preset, importing, selecting a
-     * different joint, or a manual slider/dial edit. It is deliberately NOT called from the
-     * 60fps animation loop; see refreshJointTransforms() for that.
-     */
     private void updateRobot3D() {
         jointsGroup.getChildren().clear();
         jointAxisNodes.clear();
@@ -795,7 +1003,8 @@ public class kinematic3DApp extends Application {
             jointsGroup.getChildren().add(axis);
             jointAxisNodes.add(axis);
 
-            if (i == selectedJointIndex) {
+            // FIX: Draw the highlight box on the actual coordinate frame belonging to the selected index
+            if (i == selectedJointIndex + 1) {
                 highlightBoxNode = createSelectionHighlightBox(4.5);
                 applyMatrixToNode(highlightBoxNode, mat);
                 jointsGroup.getChildren().add(highlightBoxNode);
@@ -808,8 +1017,6 @@ public class kinematic3DApp extends Application {
                 Point3D start = new Point3D(pPrev[0], pPrev[1], pPrev[2]);
                 Point3D end = new Point3D(pCurr[0], pCurr[1], pCurr[2]);
 
-                // Flag the link red if either endpoint has dipped below the floor - a visible,
-                // immediate cue on top of the floor plane itself.
                 boolean prevBelow = pPrev[2] < -FLOOR_EPSILON;
                 Color linkColor = (belowFloor || prevBelow) ? Color.web("#e06c75") : Color.GRAY;
 
@@ -820,12 +1027,6 @@ public class kinematic3DApp extends Application {
         }
     }
 
-    /**
-     * FAST PATH: updates only the transforms of already-existing joint/link nodes - no new
-     * geometry is allocated. Safe to call every animation frame. Only theta/alpha change
-     * during playback (link lengths 'a'/'d' stay fixed), so reusing each Cylinder's existing
-     * mesh and just repositioning/reorienting it is valid and cheap.
-     */
     private void refreshJointTransforms() {
         List<Matrix4x4> transforms = computeCurrentTransforms();
 
@@ -835,7 +1036,8 @@ public class kinematic3DApp extends Application {
             Matrix4x4 mat = transforms.get(i);
             replaceMatrixOnNode(jointAxisNodes.get(i), mat);
 
-            if (i == selectedJointIndex && highlightBoxNode != null) {
+            // FIX: Refresh the highlight frame utilizing the correct +1 shift
+            if (i == selectedJointIndex + 1 && highlightBoxNode != null) {
                 replaceMatrixOnNode(highlightBoxNode, mat);
             }
 
@@ -858,7 +1060,6 @@ public class kinematic3DApp extends Application {
         node.getTransforms().add(affine);
     }
 
-    /** Like applyMatrixToNode, but replaces the node's existing transform instead of stacking. */
     private void replaceMatrixOnNode(Node node, Matrix4x4 m) {
         Affine affine = new Affine(
                 m.get(0, 0), m.get(0, 1), m.get(0, 2), m.get(0, 3),
@@ -868,7 +1069,6 @@ public class kinematic3DApp extends Application {
         node.getTransforms().setAll(affine);
     }
 
-    /** Repositions/reorients an existing link Cylinder between two points without reallocating it. */
     private void updateLinkTransform(Cylinder cylinder, Point3D p1, Point3D p2) {
         if (cylinder == null) return;
         Point3D diff = p2.subtract(p1);
@@ -912,13 +1112,10 @@ public class kinematic3DApp extends Application {
     private void loadScaraPreset() {
         dhModels.clear();
         jointIsPrismatic.clear();
-        // Joint 1: Base turn [-120°, 120°]
         dhModels.add(new DHParameterModel(10.0, 0.0, 0.0, 0.0, -120.0, 120.0));
         jointIsPrismatic.add(false);
-        // Joint 2: Elbow [-110°, 110°] prevents link foldback collision
         dhModels.add(new DHParameterModel(8.0, 180.0, 0.0, 0.0, -110.0, 110.0));
         jointIsPrismatic.add(false);
-        // Joint 3: Prismatic translation offset - actually driven by d now, not theta
         dhModels.add(new DHParameterModel(0.0, 0.0, 5.0, 0.0, -90.0, 90.0));
         jointIsPrismatic.add(true);
         selectedJointIndex = 0;
@@ -1006,19 +1203,18 @@ public class kinematic3DApp extends Application {
                 updateRobot3D();
             }
         } catch (Exception e) {
-            showErrorDialog("Import Error", STR."Failed to load DH table: \{e.getMessage()}");
+            showErrorDialog("Import Error", "Failed to load DH table: " + e.getMessage());
         }
     }
 
     private double extractJsonDouble(String jsonObj, String key) {
-        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(STR."\"\{key}\"\\s*:\\s*([-+]?[0-9]*\\.?[0-9]+)");
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("\"" + key + "\"\\s*:\\s*([-+]?[0-9]*\\.?[0-9]+)");
         java.util.regex.Matcher matcher = pattern.matcher(jsonObj);
         return matcher.find() ? Double.parseDouble(matcher.group(1)) : 0.0;
     }
 
-    /** Returns the string value for key, or null if absent - used so older exports without "type" still import fine. */
     private String extractJsonString(String jsonObj, String key) {
-        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(STR."\"\{key}\"\\s*:\\s*\"([^\"]*)\"");
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
         java.util.regex.Matcher matcher = pattern.matcher(jsonObj);
         return matcher.find() ? matcher.group(1) : null;
     }
