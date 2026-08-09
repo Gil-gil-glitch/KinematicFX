@@ -252,54 +252,62 @@ public class kinematic3DApp extends Application {
 
     /**
      * Runs the SAME per-joint verification the breakdown panel does (actual step, derived from
-     * the engine's own cumulative output, vs the independently-computed Rz*Tz*Tx*Rx product),
-     * but across every joint in the chain at once, so the whole thing can be checked in one
-     * action instead of clicking through each joint individually.
+     * the engine's own cumulative output, vs a candidate product), but across every joint in the
+     * chain at once - and, like the breakdown panel, tests several candidate conventions rather
+     * than assuming Rz*Tz*Tx*Rx is correct. Aggregating the residual for each candidate across
+     * the WHOLE chain (rather than per joint) is more robust: a joint with alpha=0, for example,
+     * can spuriously "match" several different candidates on its own, but a single consistent
+     * convention should fit every joint simultaneously if the engine is internally consistent.
      */
     private void runFullChainSelfTest() {
         List<Matrix4x4> transforms = computeCurrentTransforms();
-        if (transforms.isEmpty()) {
+        if (transforms.isEmpty() || dhModels.isEmpty()) {
             selfTestResultLabel.setText("No joints to test.");
             selfTestResultLabel.setStyle("-fx-text-fill: #abb2bf; -fx-font-size: 11px;");
             return;
         }
 
-        double worstDiff = 0;
-        int worstJoint = -1;
+        // Use joint 0's candidate list just to get the set of names/count; each joint gets its
+        // own candidate matrices computed from its own parameters below.
+        int numCandidates = buildCandidateSteps(0, 0, 0, 0).size();
+        double[] worstPerCandidate = new double[numCandidates];
+        int[] worstJointPerCandidate = new int[numCandidates];
+        String[] candidateNames = new String[numCandidates];
 
         for (int i = 0; i < dhModels.size(); i++) {
             DHParameterModel model = dhModels.get(i);
-
-            double[][] rz = rotZMatrix(model.getTheta());
-            double[][] tz = transZMatrix(model.getD());
-            double[][] tx = transXMatrix(model.getA());
-            double[][] rx = rotXMatrix(model.getAlpha());
-            double[][] candidateStep = matMul4(matMul4(rz, tz), matMul4(tx, rx));
+            List<ConventionCandidate> candidates = buildCandidateSteps(model.getTheta(), model.getD(), model.getA(), model.getAlpha());
 
             double[][] prevCumulative = (i == 0) ? identity4() : toArray(transforms.get(i - 1));
             double[][] currCumulative = toArray(transforms.get(i));
             double[][] actualStep = matMul4(invertRigid(prevCumulative), currCumulative);
 
-            for (int r = 0; r < 3; r++) {
-                for (int c = 0; c < 4; c++) {
-                    double diff = Math.abs(actualStep[r][c] - candidateStep[r][c]);
-                    if (diff > worstDiff) {
-                        worstDiff = diff;
-                        worstJoint = i;
-                    }
+            for (int k = 0; k < candidates.size(); k++) {
+                candidateNames[k] = candidates.get(k).name;
+                double diff = maxDiff4(actualStep, candidates.get(k).matrix);
+                if (diff > worstPerCandidate[k]) {
+                    worstPerCandidate[k] = diff;
+                    worstJointPerCandidate[k] = i;
                 }
             }
         }
 
-        if (worstDiff < 1e-3) {
+        int bestCandidate = 0;
+        for (int k = 1; k < numCandidates; k++) {
+            if (worstPerCandidate[k] < worstPerCandidate[bestCandidate]) bestCandidate = k;
+        }
+
+        double bestDiff = worstPerCandidate[bestCandidate];
+
+        if (bestDiff < 1e-3) {
             selfTestResultLabel.setText(String.format(
-                    "\u2713 All %d joint(s) match the standard Rz\u00B7Tz\u00B7Tx\u00B7Rx convention (max discrepancy %.5f)",
-                    dhModels.size(), worstDiff));
+                    "\u2713 All %d joint(s) consistently match: %s (max discrepancy %.5f)",
+                    dhModels.size(), candidateNames[bestCandidate], bestDiff));
             selfTestResultLabel.setStyle("-fx-text-fill: #98c379; -fx-font-size: 11px; -fx-font-weight: bold;");
         } else {
             selfTestResultLabel.setText(String.format(
-                    "\u26A0 Joint %d diverges from the standard convention by %.3f - the other joint(s) check out",
-                    worstJoint + 1, worstDiff));
+                    "\u26A0 No tested convention fits the whole chain (closest: %s, worst joint %d off by %.3f) - share DHParameter.java to pin down the exact formula",
+                    candidateNames[bestCandidate], worstJointPerCandidate[bestCandidate] + 1, bestDiff));
             selfTestResultLabel.setStyle("-fx-text-fill: #e5c07b; -fx-font-size: 11px; -fx-font-weight: bold;");
         }
     }
@@ -392,6 +400,69 @@ public class kinematic3DApp extends Application {
         return new double[][]{{1, 0, 0, a}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
     }
 
+    private double[][] rotYMatrix(double alphaDeg) {
+        double a = Math.toRadians(alphaDeg);
+        double c = Math.cos(a), s = Math.sin(a);
+        return new double[][]{{c, 0, s, 0}, {0, 1, 0, 0}, {-s, 0, c, 0}, {0, 0, 0, 1}};
+    }
+
+    private double[][] transYMatrix(double a) {
+        return new double[][]{{1, 0, 0, 0}, {0, 1, 0, a}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+    }
+
+    /** One hypothesis for how a DH row's (theta, d, a, alpha) composes into a step matrix. */
+    private static class ConventionCandidate {
+        final String name;
+        final double[][] matrix;
+        ConventionCandidate(String name, double[][] matrix) {
+            this.name = name;
+            this.matrix = matrix;
+        }
+    }
+
+    /**
+     * Builds a small set of plausible DH conventions for this one joint's parameters. Rz/Tz
+     * commute (both act on the z-axis) and Tx/Rx commute (both act on the x-axis), so the only
+     * structurally distinct choices are: which pair goes first, sign conventions on the two
+     * angles, and which axis carries the "twist" (X vs Y). Rather than assuming one of these is
+     * correct, every feature that checks convention tests all of them against the engine's
+     * actual output and reports whichever one actually matches.
+     */
+    private List<ConventionCandidate> buildCandidateSteps(double theta, double d, double a, double alpha) {
+        double[][] rz = rotZMatrix(theta);
+        double[][] rzNeg = rotZMatrix(-theta);
+        double[][] tz = transZMatrix(d);
+        double[][] tx = transXMatrix(a);
+        double[][] rx = rotXMatrix(alpha);
+        double[][] rxNeg = rotXMatrix(-alpha);
+        double[][] ty = transYMatrix(a);
+        double[][] ry = rotYMatrix(alpha);
+
+        List<ConventionCandidate> list = new ArrayList<>();
+        list.add(new ConventionCandidate("Standard DH: Rz(\u03B8)\u00B7Tz(d)\u00B7Tx(a)\u00B7Rx(\u03B1)",
+                matMul4(matMul4(rz, tz), matMul4(tx, rx))));
+        list.add(new ConventionCandidate("Modified DH: Rx(\u03B1)\u00B7Tx(a)\u00B7Rz(\u03B8)\u00B7Tz(d)",
+                matMul4(matMul4(rx, tx), matMul4(rz, tz))));
+        list.add(new ConventionCandidate("Standard DH, \u03B8 sign flipped: Rz(-\u03B8)\u00B7Tz(d)\u00B7Tx(a)\u00B7Rx(\u03B1)",
+                matMul4(matMul4(rzNeg, tz), matMul4(tx, rx))));
+        list.add(new ConventionCandidate("Standard DH, \u03B1 sign flipped: Rz(\u03B8)\u00B7Tz(d)\u00B7Tx(a)\u00B7Rx(-\u03B1)",
+                matMul4(matMul4(rz, tz), matMul4(tx, rxNeg))));
+        list.add(new ConventionCandidate("Standard DH, twist on Y instead of X: Rz(\u03B8)\u00B7Tz(d)\u00B7Ty(a)\u00B7Ry(\u03B1)",
+                matMul4(matMul4(rz, tz), matMul4(ty, ry))));
+        return list;
+    }
+
+    /** Max discrepancy (rows 0-2, all 4 columns) between two 4x4 step matrices. */
+    private double maxDiff4(double[][] a, double[][] b) {
+        double worst = 0;
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 4; c++) {
+                worst = Math.max(worst, Math.abs(a[r][c] - b[r][c]));
+            }
+        }
+        return worst;
+    }
+
     private double[][] identity4() {
         return new double[][]{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
     }
@@ -436,11 +507,12 @@ public class kinematic3DApp extends Application {
 
     /**
      * Updates the elementary-transform breakdown for the currently selected joint, and
-     * self-verifies it: rather than assuming this engine uses the standard Rz*Tz*Tx*Rx DH
-     * convention, the ACTUAL step transform is derived from the engine's own cumulative
-     * output (by inverting the previous joint's transform into the current one), and compared
-     * against the candidate product. If they don't match, the breakdown is flagged as such
-     * instead of silently presenting unverified numbers.
+     * self-verifies it: rather than assuming this engine uses one specific DH convention, every
+     * candidate from buildCandidateSteps() is tested against the engine's ACTUAL step transform
+     * (derived from its own cumulative output, by inverting the previous joint's transform into
+     * the current one), and whichever one actually matches is reported. The 4 displayed grids
+     * (Rz, Tz, Tx, Rx) always show the standard building blocks - the status line tells you the
+     * order they actually need to be applied in for this engine.
      */
     private void updateTransformBreakdown(List<Matrix4x4> transforms) {
         if (!showTransformBreakdown || transforms.isEmpty()) return;
@@ -448,10 +520,12 @@ public class kinematic3DApp extends Application {
         int idx = Math.max(0, Math.min(selectedJointIndex, transforms.size() - 1));
         DHParameterModel model = dhModels.get(idx);
 
-        double[][] rz = rotZMatrix(model.getTheta());
-        double[][] tz = transZMatrix(model.getD());
-        double[][] tx = transXMatrix(model.getA());
-        double[][] rx = rotXMatrix(model.getAlpha());
+        double theta = model.getTheta(), d = model.getD(), a = model.getA(), alpha = model.getAlpha();
+
+        double[][] rz = rotZMatrix(theta);
+        double[][] tz = transZMatrix(d);
+        double[][] tx = transXMatrix(a);
+        double[][] rx = rotXMatrix(alpha);
 
         setGridValues(rzLabels, rz);
         setGridValues(tzLabels, tz);
@@ -462,22 +536,24 @@ public class kinematic3DApp extends Application {
         double[][] currCumulative = toArray(transforms.get(idx));
         double[][] actualStep = matMul4(invertRigid(prevCumulative), currCumulative);
 
-        double[][] candidateStep = matMul4(matMul4(rz, tz), matMul4(tx, rx));
-
-        double maxDiff = 0;
-        for (int r = 0; r < 3; r++) {
-            for (int c = 0; c < 4; c++) {
-                maxDiff = Math.max(maxDiff, Math.abs(actualStep[r][c] - candidateStep[r][c]));
+        List<ConventionCandidate> candidates = buildCandidateSteps(theta, d, a, alpha);
+        ConventionCandidate best = null;
+        double bestDiff = Double.MAX_VALUE;
+        for (ConventionCandidate c : candidates) {
+            double diff = maxDiff4(actualStep, c.matrix);
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                best = c;
             }
         }
 
-        if (maxDiff < 1e-3) {
-            breakdownStatusLabel.setText("\u2713 Product matches the engine's actual step transform (standard Rz\u00B7Tz\u00B7Tx\u00B7Rx convention confirmed)");
+        if (bestDiff < 1e-3) {
+            breakdownStatusLabel.setText("\u2713 Matches: " + best.name + String.format(" (max discrepancy %.5f)", bestDiff));
             breakdownStatusLabel.setStyle("-fx-text-fill: #98c379; -fx-font-size: 10px; -fx-font-weight: bold;");
         } else {
             breakdownStatusLabel.setText(String.format(
-                    "\u26A0 Product differs from the engine's actual step transform by up to %.3f - this engine may use a different DH convention than Rz\u00B7Tz\u00B7Tx\u00B7Rx",
-                    maxDiff));
+                    "\u26A0 No tested convention matches this joint (closest: %s, off by %.3f) - share DHParameter.java to pin down the exact formula",
+                    best.name, bestDiff));
             breakdownStatusLabel.setStyle("-fx-text-fill: #e5c07b; -fx-font-size: 10px; -fx-font-weight: bold;");
         }
     }
