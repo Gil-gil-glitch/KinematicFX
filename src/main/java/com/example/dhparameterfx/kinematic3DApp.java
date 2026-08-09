@@ -88,6 +88,18 @@ public class kinematic3DApp extends Application {
     private boolean showFloorPlane = true;
     private static final double FLOOR_EPSILON = 0.05;
 
+    // Elementary transform breakdown panel: cached Label nodes so we only ever setText() on
+    // them (called from the same hot path as the HUD, up to 60fps) rather than rebuilding
+    // GridPanes every frame.
+    private boolean showTransformBreakdown = false;
+    private VBox transformBreakdownPanel;
+    private Label breakdownStatusLabel;
+    private Label selfTestResultLabel;
+    private final Label[][] rzLabels = new Label[4][4];
+    private final Label[][] tzLabels = new Label[4][4];
+    private final Label[][] txLabels = new Label[4][4];
+    private final Label[][] rxLabels = new Label[4][4];
+
     // Planned-path trail state
     private boolean showPlannedTrail = true;
 
@@ -186,11 +198,19 @@ public class kinematic3DApp extends Application {
         // Create HUD Overlay
         hud = new MatrixDisplayHUD();
 
+        // Elementary transform breakdown overlay, built once (labels updated via setText
+        // afterward, never rebuilt per-frame).
+        transformBreakdownPanel = buildTransformBreakdownPanel();
+        transformBreakdownPanel.setVisible(showTransformBreakdown);
+        transformBreakdownPanel.setMouseTransparent(true);
+
         // Layer SubScene and HUD using StackPane
         StackPane viewportPane = new StackPane();
-        viewportPane.getChildren().addAll(subScene, hud);
+        viewportPane.getChildren().addAll(subScene, hud, transformBreakdownPanel);
         StackPane.setAlignment(hud, Pos.TOP_LEFT);
         StackPane.setMargin(hud, new Insets(15));
+        StackPane.setAlignment(transformBreakdownPanel, Pos.BOTTOM_LEFT);
+        StackPane.setMargin(transformBreakdownPanel, new Insets(15));
 
         BorderPane root = new BorderPane();
         root.setCenter(viewportPane);
@@ -230,10 +250,236 @@ public class kinematic3DApp extends Application {
         primaryStage.show();
     }
 
+    /**
+     * Runs the SAME per-joint verification the breakdown panel does (actual step, derived from
+     * the engine's own cumulative output, vs the independently-computed Rz*Tz*Tx*Rx product),
+     * but across every joint in the chain at once, so the whole thing can be checked in one
+     * action instead of clicking through each joint individually.
+     */
+    private void runFullChainSelfTest() {
+        List<Matrix4x4> transforms = computeCurrentTransforms();
+        if (transforms.isEmpty()) {
+            selfTestResultLabel.setText("No joints to test.");
+            selfTestResultLabel.setStyle("-fx-text-fill: #abb2bf; -fx-font-size: 11px;");
+            return;
+        }
+
+        double worstDiff = 0;
+        int worstJoint = -1;
+
+        for (int i = 0; i < dhModels.size(); i++) {
+            DHParameterModel model = dhModels.get(i);
+
+            double[][] rz = rotZMatrix(model.getTheta());
+            double[][] tz = transZMatrix(model.getD());
+            double[][] tx = transXMatrix(model.getA());
+            double[][] rx = rotXMatrix(model.getAlpha());
+            double[][] candidateStep = matMul4(matMul4(rz, tz), matMul4(tx, rx));
+
+            double[][] prevCumulative = (i == 0) ? identity4() : toArray(transforms.get(i - 1));
+            double[][] currCumulative = toArray(transforms.get(i));
+            double[][] actualStep = matMul4(invertRigid(prevCumulative), currCumulative);
+
+            for (int r = 0; r < 3; r++) {
+                for (int c = 0; c < 4; c++) {
+                    double diff = Math.abs(actualStep[r][c] - candidateStep[r][c]);
+                    if (diff > worstDiff) {
+                        worstDiff = diff;
+                        worstJoint = i;
+                    }
+                }
+            }
+        }
+
+        if (worstDiff < 1e-3) {
+            selfTestResultLabel.setText(String.format(
+                    "\u2713 All %d joint(s) match the standard Rz\u00B7Tz\u00B7Tx\u00B7Rx convention (max discrepancy %.5f)",
+                    dhModels.size(), worstDiff));
+            selfTestResultLabel.setStyle("-fx-text-fill: #98c379; -fx-font-size: 11px; -fx-font-weight: bold;");
+        } else {
+            selfTestResultLabel.setText(String.format(
+                    "\u26A0 Joint %d diverges from the standard convention by %.3f - the other joint(s) check out",
+                    worstJoint + 1, worstDiff));
+            selfTestResultLabel.setStyle("-fx-text-fill: #e5c07b; -fx-font-size: 11px; -fx-font-weight: bold;");
+        }
+    }
+
     private void updateTargetSpherePosition() {
         targetSphere.setTranslateX(targetPos[0]);
         targetSphere.setTranslateY(targetPos[1]);
         targetSphere.setTranslateZ(targetPos[2]);
+    }
+
+    /** Builds one small labeled 4x4 grid of cached Label cells for a matrix card. */
+    private VBox buildMatrixCard(String title, Label[][] labelRefs) {
+        Label header = new Label(title);
+        header.setStyle("-fx-text-fill: #61afef; -fx-font-weight: bold; -fx-font-size: 10px;");
+
+        GridPane grid = new GridPane();
+        grid.setHgap(5);
+        grid.setVgap(2);
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 4; c++) {
+                Label cell = new Label("0.00");
+                cell.setStyle("-fx-text-fill: #d0d0d0; -fx-font-family: monospace; -fx-font-size: 10px;");
+                cell.setMinWidth(42);
+                cell.setAlignment(Pos.CENTER_RIGHT);
+                grid.add(cell, c, r);
+                labelRefs[r][c] = cell;
+            }
+        }
+
+        VBox card = new VBox(3, header, grid);
+        card.setStyle("-fx-background-color: rgba(30,30,36,0.9); -fx-padding: 6; -fx-background-radius: 4;");
+        return card;
+    }
+
+    /** Builds the full elementary-transform-breakdown overlay panel, once. */
+    private VBox buildTransformBreakdownPanel() {
+        VBox rzCard = buildMatrixCard("Rot_z(\u03B8)", rzLabels);
+        VBox tzCard = buildMatrixCard("Trans_z(d)", tzLabels);
+        VBox txCard = buildMatrixCard("Trans_x(a)", txLabels);
+        VBox rxCard = buildMatrixCard("Rot_x(\u03B1)", rxLabels);
+
+        HBox matricesRow = new HBox(8, rzCard, tzCard, txCard, rxCard);
+
+        Label title = new Label("Elementary Transforms - Selected Joint");
+        title.setStyle("-fx-text-fill: white; -fx-font-weight: bold; -fx-font-size: 11px;");
+
+        breakdownStatusLabel = new Label();
+        breakdownStatusLabel.setWrapText(true);
+        breakdownStatusLabel.setMaxWidth(400);
+        breakdownStatusLabel.setStyle("-fx-font-size: 10px; -fx-font-weight: bold;");
+
+        VBox panel = new VBox(6, title, matricesRow, breakdownStatusLabel);
+        panel.setStyle("-fx-background-color: rgba(20,20,24,0.8); -fx-padding: 10; -fx-background-radius: 6;");
+        return panel;
+    }
+
+    // --- Plain 4x4 matrix math, independent of Matrix4x4/ForwardKinematicsEngine internals.
+    // Used only to build the 4 candidate elementary transforms and to verify them against the
+    // engine's own actual output - see updateTransformBreakdown() below. ---
+
+    private double[][] matMul4(double[][] A, double[][] B) {
+        double[][] R = new double[4][4];
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 4; c++) {
+                double sum = 0;
+                for (int k = 0; k < 4; k++) sum += A[r][k] * B[k][c];
+                R[r][c] = sum;
+            }
+        }
+        return R;
+    }
+
+    private double[][] rotZMatrix(double thetaDeg) {
+        double t = Math.toRadians(thetaDeg);
+        double c = Math.cos(t), s = Math.sin(t);
+        return new double[][]{{c, -s, 0, 0}, {s, c, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+    }
+
+    private double[][] rotXMatrix(double alphaDeg) {
+        double a = Math.toRadians(alphaDeg);
+        double c = Math.cos(a), s = Math.sin(a);
+        return new double[][]{{1, 0, 0, 0}, {0, c, -s, 0}, {0, s, c, 0}, {0, 0, 0, 1}};
+    }
+
+    private double[][] transZMatrix(double d) {
+        return new double[][]{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, d}, {0, 0, 0, 1}};
+    }
+
+    private double[][] transXMatrix(double a) {
+        return new double[][]{{1, 0, 0, a}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+    }
+
+    private double[][] identity4() {
+        return new double[][]{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+    }
+
+    /** Extracts a plain 4x4 array from a Matrix4x4. Row 3 is hardcoded to [0,0,0,1] rather than
+     * queried, since only rows 0-2 are used anywhere else in this file (get(3,c) is untested). */
+    private double[][] toArray(Matrix4x4 m) {
+        double[][] out = new double[4][4];
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 4; c++) {
+                out[r][c] = m.get(r, c);
+            }
+        }
+        out[3] = new double[]{0, 0, 0, 1};
+        return out;
+    }
+
+    /** Inverse of a rigid (rotation + translation) homogeneous transform: [R^T, -R^T p; 0 0 0 1]. */
+    private double[][] invertRigid(double[][] T) {
+        double[][] inv = new double[4][4];
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 3; c++) {
+                inv[r][c] = T[c][r];
+            }
+        }
+        for (int r = 0; r < 3; r++) {
+            double sum = 0;
+            for (int k = 0; k < 3; k++) sum += inv[r][k] * T[k][3];
+            inv[r][3] = -sum;
+        }
+        inv[3] = new double[]{0, 0, 0, 1};
+        return inv;
+    }
+
+    private void setGridValues(Label[][] labels, double[][] values) {
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 4; c++) {
+                labels[r][c].setText(String.format("%.2f", values[r][c]));
+            }
+        }
+    }
+
+    /**
+     * Updates the elementary-transform breakdown for the currently selected joint, and
+     * self-verifies it: rather than assuming this engine uses the standard Rz*Tz*Tx*Rx DH
+     * convention, the ACTUAL step transform is derived from the engine's own cumulative
+     * output (by inverting the previous joint's transform into the current one), and compared
+     * against the candidate product. If they don't match, the breakdown is flagged as such
+     * instead of silently presenting unverified numbers.
+     */
+    private void updateTransformBreakdown(List<Matrix4x4> transforms) {
+        if (!showTransformBreakdown || transforms.isEmpty()) return;
+
+        int idx = Math.max(0, Math.min(selectedJointIndex, transforms.size() - 1));
+        DHParameterModel model = dhModels.get(idx);
+
+        double[][] rz = rotZMatrix(model.getTheta());
+        double[][] tz = transZMatrix(model.getD());
+        double[][] tx = transXMatrix(model.getA());
+        double[][] rx = rotXMatrix(model.getAlpha());
+
+        setGridValues(rzLabels, rz);
+        setGridValues(tzLabels, tz);
+        setGridValues(txLabels, tx);
+        setGridValues(rxLabels, rx);
+
+        double[][] prevCumulative = (idx == 0) ? identity4() : toArray(transforms.get(idx - 1));
+        double[][] currCumulative = toArray(transforms.get(idx));
+        double[][] actualStep = matMul4(invertRigid(prevCumulative), currCumulative);
+
+        double[][] candidateStep = matMul4(matMul4(rz, tz), matMul4(tx, rx));
+
+        double maxDiff = 0;
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 4; c++) {
+                maxDiff = Math.max(maxDiff, Math.abs(actualStep[r][c] - candidateStep[r][c]));
+            }
+        }
+
+        if (maxDiff < 1e-3) {
+            breakdownStatusLabel.setText("\u2713 Product matches the engine's actual step transform (standard Rz\u00B7Tz\u00B7Tx\u00B7Rx convention confirmed)");
+            breakdownStatusLabel.setStyle("-fx-text-fill: #98c379; -fx-font-size: 10px; -fx-font-weight: bold;");
+        } else {
+            breakdownStatusLabel.setText(String.format(
+                    "\u26A0 Product differs from the engine's actual step transform by up to %.3f - this engine may use a different DH convention than Rz\u00B7Tz\u00B7Tx\u00B7Rx",
+                    maxDiff));
+            breakdownStatusLabel.setStyle("-fx-text-fill: #e5c07b; -fx-font-size: 10px; -fx-font-weight: bold;");
+        }
     }
 
     /** Computes the cumulative FK transforms for the DH chain's current pose. */
@@ -263,6 +509,7 @@ public class kinematic3DApp extends Application {
         if (transforms.isEmpty() || hud == null) return;
         int idx = Math.max(0, Math.min(selectedJointIndex, transforms.size() - 1));
         hud.update(transforms.get(idx));
+        updateTransformBreakdown(transforms);
     }
 
     /**
@@ -539,8 +786,28 @@ public class kinematic3DApp extends Application {
             trailGroup.setVisible(newV);
         });
 
+        CheckBox breakdownToggle = new CheckBox("Show elementary transform breakdown");
+        breakdownToggle.setSelected(showTransformBreakdown);
+        breakdownToggle.setStyle("-fx-text-fill: #abb2bf; -fx-font-size: 11px;");
+        breakdownToggle.selectedProperty().addListener((o, oldV, newV) -> {
+            showTransformBreakdown = newV;
+            transformBreakdownPanel.setVisible(newV);
+            if (newV) {
+                updateTransformBreakdown(computeCurrentTransforms());
+            }
+        });
+
+        Button selfTestBtn = new Button("Run Self-Test (verify whole chain)");
+        selfTestBtn.setMaxWidth(Double.MAX_VALUE);
+        selfTestBtn.setStyle("-fx-background-color: #3b3b4d; -fx-text-fill: #abb2bf; -fx-font-size: 11px;");
+        selfTestBtn.setOnAction(e -> runFullChainSelfTest());
+
+        selfTestResultLabel = new Label();
+        selfTestResultLabel.setWrapText(true);
+        selfTestResultLabel.setMaxWidth(300);
+
         ikBox.getChildren().addAll(targetXRow, targetYRow, targetZRow, planMotionBtn,
-                floorPlaneToggle, trailToggle);
+                floorPlaneToggle, trailToggle, breakdownToggle, selfTestBtn, selfTestResultLabel);
 
         controlsContainer = new VBox(12);
         ScrollPane scrollPane = new ScrollPane(controlsContainer);
@@ -1006,19 +1273,19 @@ public class kinematic3DApp extends Application {
                 updateRobot3D();
             }
         } catch (Exception e) {
-            showErrorDialog("Import Error", STR."Failed to load DH table: \{e.getMessage()}");
+            showErrorDialog("Import Error", "Failed to load DH table: " + e.getMessage());
         }
     }
 
     private double extractJsonDouble(String jsonObj, String key) {
-        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(STR."\"\{key}\"\\s*:\\s*([-+]?[0-9]*\\.?[0-9]+)");
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("\"" + key + "\"\\s*:\\s*([-+]?[0-9]*\\.?[0-9]+)");
         java.util.regex.Matcher matcher = pattern.matcher(jsonObj);
         return matcher.find() ? Double.parseDouble(matcher.group(1)) : 0.0;
     }
 
     /** Returns the string value for key, or null if absent - used so older exports without "type" still import fine. */
     private String extractJsonString(String jsonObj, String key) {
-        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(STR."\"\{key}\"\\s*:\\s*\"([^\"]*)\"");
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
         java.util.regex.Matcher matcher = pattern.matcher(jsonObj);
         return matcher.find() ? matcher.group(1) : null;
     }
