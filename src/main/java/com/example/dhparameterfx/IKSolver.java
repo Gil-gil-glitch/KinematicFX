@@ -30,9 +30,18 @@ public class IKSolver {
     }
 
     public boolean solve(List<DHParameterModel> dhModels, double[] targetPos, int maxIterations, double tolerance) {
+        return solve(dhModels, targetPos, maxIterations, tolerance, null);
+    }
+
+    /**
+     * @param isPrismatic per-joint type: true = driven by d (prismatic), false/absent-index/null
+     *                     list = driven by theta (revolute). Same length/order as dhModels.
+     */
+    public boolean solve(List<DHParameterModel> dhModels, double[] targetPos, int maxIterations, double tolerance,
+                         List<Boolean> isPrismatic) {
         double lambda = 0.2; // Slightly higher damping for Z-axis stability
         double bestError = Double.MAX_VALUE;
-        double[] bestThetas = new double[dhModels.size()];
+        double[] bestQ = new double[dhModels.size()];
 
         int numJoints = dhModels.size();
         double maxCartesianStep = 1.0; // Max distance the end-effector can attempt to move per iteration
@@ -55,7 +64,7 @@ public class IKSolver {
             if (errorDist < bestError) {
                 bestError = errorDist;
                 for (int i = 0; i < numJoints; i++) {
-                    bestThetas[i] = dhModels.get(i).getTheta();
+                    bestQ[i] = isPrismatic(isPrismatic, i) ? dhModels.get(i).getD() : dhModels.get(i).getTheta();
                 }
             }
 
@@ -74,7 +83,7 @@ public class IKSolver {
                 ez *= scale;
             }
 
-            double[][] J = computePositionJacobian(dhModels, currentPos);
+            double[][] J = computePositionJacobian(dhModels, currentPos, isPrismatic);
 
             // Compute Damped Pseudoinverse J_damped = J^T * (J * J^T + lambda^2 * I)^-1
             double[][] A = new double[3][3];
@@ -101,18 +110,43 @@ public class IKSolver {
             for (int j = 0; j < numJoints; j++) {
                 DHParameterModel model = dhModels.get(j);
 
-                // Calculate required movement for this joint in degrees
-                double dqDeg = Math.toDegrees(J[0][j] * dampedErr[0] + J[1][j] * dampedErr[1] + J[2][j] * dampedErr[2]);
+                double rawDelta = J[0][j] * dampedErr[0] + J[1][j] * dampedErr[1] + J[2][j] * dampedErr[2];
 
-                // Keep the angular step cap to prevent singularity teleportation
-                if (dqDeg > 10.0) dqDeg = 10.0;
-                if (dqDeg < -10.0) dqDeg = -10.0;
+                if (isPrismatic(isPrismatic, j)) {
+                    // rawDelta is already in linear units (no radians/degrees conversion needed,
+                    // since the Jacobian column for a prismatic joint was built by perturbing d
+                    // directly - see computePositionJacobian).
+                    double dLinear = rawDelta;
 
-                double newTheta = model.getTheta() + dqDeg;
+                    // Per-iteration step cap, analogous to the 10 deg/iteration cap below - keeps
+                    // the solver from taking a huge jump toward a singularity.
+                    if (dLinear > 2.0) dLinear = 2.0;
+                    if (dLinear < -2.0) dLinear = -2.0;
 
-                // Hard clamp to configured joint bounds
-                if (newTheta > model.getMaxTheta()) newTheta = model.getMaxTheta();
-                if (newTheta < model.getMinTheta()) newTheta = model.getMinTheta();
+                    double newD = model.getD() + dLinear;
+
+                    // DHParameterModel doesn't expose configured min/max bounds for d (only for
+                    // theta), so this is a generous safety bound rather than a precision limit.
+                    if (newD > 50.0) newD = 50.0;
+                    if (newD < -50.0) newD = -50.0;
+
+                    model.dProperty().set(newD);
+                } else {
+                    // Calculate required movement for this joint in degrees
+                    double dqDeg = Math.toDegrees(rawDelta);
+
+                    // Keep the angular step cap to prevent singularity teleportation
+                    if (dqDeg > 10.0) dqDeg = 10.0;
+                    if (dqDeg < -10.0) dqDeg = -10.0;
+
+                    double newTheta = model.getTheta() + dqDeg;
+
+                    // Hard clamp to configured joint bounds
+                    if (newTheta > model.getMaxTheta()) newTheta = model.getMaxTheta();
+                    if (newTheta < model.getMinTheta()) newTheta = model.getMinTheta();
+
+                    model.setTheta(newTheta);
+                }
 
                 // CARTESIAN ERROR CLAMPING & FLOOR GUARD
                 if (errorDist > maxCartesianStep) {
@@ -130,32 +164,48 @@ public class IKSolver {
                     ez = -currentPos[2]; // Cap the downward movement exactly at the floor (Z=0)
 
                 }
-
-                model.setTheta(newTheta);
             }
         }
 
         // Restore the best configuration achieved
         for (int i = 0; i < numJoints; i++) {
-            dhModels.get(i).setTheta(bestThetas[i]);
+            if (isPrismatic(isPrismatic, i)) {
+                dhModels.get(i).dProperty().set(bestQ[i]);
+            } else {
+                dhModels.get(i).setTheta(bestQ[i]);
+            }
         }
 
         return bestError <= 0.5;
     }
 
-    private double[][] computePositionJacobian(List<DHParameterModel> dhModels, double[] currentPos) {
+    private boolean isPrismatic(List<Boolean> isPrismatic, int jointIndex) {
+        return isPrismatic != null && jointIndex < isPrismatic.size() && Boolean.TRUE.equals(isPrismatic.get(jointIndex));
+    }
+
+    private double[][] computePositionJacobian(List<DHParameterModel> dhModels, double[] currentPos, List<Boolean> isPrismatic) {
         int n = dhModels.size();
         double[][] J = new double[3][n];
 
         for (int j = 0; j < n; j++) {
             DHParameterModel model = dhModels.get(j);
-            double origTheta = model.getTheta();
+            double[] posP;
 
-            model.setTheta(origTheta + Math.toDegrees(STEP_SIZE));
-            List<Matrix4x4> transformsP = fkEngine.computeCumulativeTransforms(getCurrentDHParams(dhModels));
-            double[] posP = transformsP.get(transformsP.size() - 1).getPosition();
-
-            model.setTheta(origTheta);
+            if (isPrismatic(isPrismatic, j)) {
+                // Prismatic: perturb d directly. Already in the same linear units as position,
+                // so no radians/degrees conversion is needed (unlike the theta case below).
+                double origD = model.getD();
+                model.dProperty().set(origD + STEP_SIZE);
+                List<Matrix4x4> transformsP = fkEngine.computeCumulativeTransforms(getCurrentDHParams(dhModels));
+                posP = transformsP.get(transformsP.size() - 1).getPosition();
+                model.dProperty().set(origD);
+            } else {
+                double origTheta = model.getTheta();
+                model.setTheta(origTheta + Math.toDegrees(STEP_SIZE));
+                List<Matrix4x4> transformsP = fkEngine.computeCumulativeTransforms(getCurrentDHParams(dhModels));
+                posP = transformsP.get(transformsP.size() - 1).getPosition();
+                model.setTheta(origTheta);
+            }
 
             J[0][j] = (posP[0] - currentPos[0]) / STEP_SIZE;
             J[1][j] = (posP[1] - currentPos[1]) / STEP_SIZE;
