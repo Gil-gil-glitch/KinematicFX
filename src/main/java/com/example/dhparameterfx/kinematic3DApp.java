@@ -230,58 +230,6 @@ public class kinematic3DApp extends Application {
         primaryStage.show();
     }
 
-    /**
-     * IKSolver only ever varies theta (confirmed by the existing code only ever capturing
-     * getTheta() into qEnd), so it can't move a prismatic joint's d toward the target on its
-     * own. This runs a small coordinate-descent pass afterward: for each prismatic joint,
-     * independently binary-search its d (holding everything else fixed) to minimize distance
-     * to the target. It only needs FK (already available via computeCurrentTransforms), so it
-     * works without any changes to IKSolver.
-     */
-    private void refinePrismaticJoints(double[] target, int passes) {
-        boolean anyPrismatic = jointIsPrismatic.contains(true);
-        if (!anyPrismatic) return;
-
-        double lo = -20.0, hi = 20.0; // matches the 'd' slider's existing UI range
-        for (int pass = 0; pass < passes; pass++) {
-            for (int i = 0; i < dhModels.size(); i++) {
-                if (jointIsPrismatic.get(i)) {
-                    minimizeDistanceOverD(i, target, lo, hi);
-                }
-            }
-        }
-    }
-
-    /** Golden-section search over joint i's d in [lo, hi] minimizing end-effector distance to target. */
-    private void minimizeDistanceOverD(int jointIndex, double[] target, double lo, double hi) {
-        double gr = (Math.sqrt(5) - 1) / 2.0;
-        double a = lo, b = hi;
-        double c = b - gr * (b - a);
-        double d = a + gr * (b - a);
-
-        for (int iter = 0; iter < 40; iter++) {
-            double errC = distanceToTargetWithD(jointIndex, c, target);
-            double errD = distanceToTargetWithD(jointIndex, d, target);
-            if (errC < errD) {
-                b = d;
-            } else {
-                a = c;
-            }
-            c = b - gr * (b - a);
-            d = a + gr * (b - a);
-        }
-
-        dhModels.get(jointIndex).dProperty().set((a + b) / 2.0);
-    }
-
-    private double distanceToTargetWithD(int jointIndex, double dVal, double[] target) {
-        dhModels.get(jointIndex).dProperty().set(dVal);
-        List<Matrix4x4> transforms = computeCurrentTransforms();
-        double[] p = transforms.get(transforms.size() - 1).getPosition();
-        double dx = p[0] - target[0], dy = p[1] - target[1], dz = p[2] - target[2];
-        return Math.sqrt(dx * dx + dy * dy + dz * dz);
-    }
-
     private void updateTargetSpherePosition() {
         targetSphere.setTranslateX(targetPos[0]);
         targetSphere.setTranslateY(targetPos[1]);
@@ -377,38 +325,17 @@ public class kinematic3DApp extends Application {
         }
 
         // 1. Capture starting configuration. qStart[i] holds theta for revolute joints, d for
-        // prismatic ones - the "driven DOF" per joint. Also separately remember the original
-        // theta for prismatic joints, since IKSolver doesn't know they're prismatic and will
-        // happily rotate them too; we undo that afterward.
+        // prismatic ones - the "driven DOF" per joint.
         double[] qStart = new double[dhModels.size()];
-        double[] prismaticOriginalTheta = new double[dhModels.size()];
         for (int i = 0; i < dhModels.size(); i++) {
             qStart[i] = getJointVar(i);
-            prismaticOriginalTheta[i] = dhModels.get(i).getTheta();
         }
 
-        // 2. Solve IK (350 iterations, 0.1 tolerance). This only ever varies theta - it has no
-        // concept of prismatic joints.
-        boolean solved = ikSolver.solve(dhModels, targetPos, 350, 0.1);
-
-        // Undo any rotation IKSolver applied to joints we consider prismatic (theta should stay
-        // fixed for those - d is what should move), then let d take over the reaching.
-        for (int i = 0; i < dhModels.size(); i++) {
-            if (jointIsPrismatic.get(i)) {
-                dhModels.get(i).setTheta(prismaticOriginalTheta[i]);
-            }
-        }
-        refinePrismaticJoints(targetPos, 3);
-
-        if (jointIsPrismatic.contains(true)) {
-            // IKSolver's 'solved' flag only reflects theta convergence, which is meaningless
-            // for a chain containing prismatic joints - re-check the actual resulting error
-            // ourselves now that the refinement pass has had a chance to move d.
-            List<Matrix4x4> checkTransforms = computeCurrentTransforms();
-            double[] p = checkTransforms.get(checkTransforms.size() - 1).getPosition();
-            double err = Math.sqrt(Math.pow(p[0] - targetPos[0], 2) + Math.pow(p[1] - targetPos[1], 2) + Math.pow(p[2] - targetPos[2], 2));
-            solved = err < 0.5; // looser than IKSolver's 0.1: coordinate descent, not a joint solve
-        }
+        // 2. Solve IK (350 iterations, 0.1 tolerance). IKSolver now takes jointIsPrismatic
+        // directly, so it builds a proper Jacobian column (and applies updates) against d for
+        // prismatic joints and theta for revolute ones - no post-hoc undo or separate
+        // coordinate-descent pass needed anymore.
+        boolean solved = ikSolver.solve(dhModels, targetPos, 350, 0.1, jointIsPrismatic);
 
         if (!solved) {
             showWarningDialog("Target Unreachable",
@@ -420,7 +347,7 @@ public class kinematic3DApp extends Application {
             return;
         }
 
-        // 3. Capture end configuration after the solver (+ prismatic refinement) finishes successfully
+        // 3. Capture end configuration after the solver finishes successfully
         double[] qEnd = new double[dhModels.size()];
         for (int i = 0; i < dhModels.size(); i++) {
             qEnd[i] = getJointVar(i);
@@ -473,17 +400,11 @@ public class kinematic3DApp extends Application {
                             Math.max(0.0, startPos[2] + s * (targetPos[2] - startPos[2])) // Floor constraint
                     };
 
-                    // Run a quick 5-iteration IK to track the line on this frame. This only
-                    // moves theta, so it will also nudge any prismatic joints' theta - undo
-                    // that below and drive their d by direct interpolation instead, synced to
-                    // the same timeline.
-                    ikSolver.solve(dhModels, currentTarget, 5, 0.1);
-                    for (int i = 0; i < dhModels.size(); i++) {
-                        if (jointIsPrismatic.get(i)) {
-                            dhModels.get(i).setTheta(prismaticOriginalTheta[i]);
-                            dhModels.get(i).dProperty().set(qStart[i] + s * (qEnd[i] - qStart[i]));
-                        }
-                    }
+                    // Run a quick 5-iteration IK to track the line on this frame. Now that
+                    // IKSolver understands jointIsPrismatic, this correctly drives d for
+                    // prismatic joints and theta for revolute ones, frame by frame - no manual
+                    // post-processing needed.
+                    ikSolver.solve(dhModels, currentTarget, 5, 0.1, jointIsPrismatic);
                 } else {
                     // JOINT SPACE: Interpolate the driven variable directly (theta for
                     // revolute joints, d for prismatic ones)
@@ -900,7 +821,7 @@ public class kinematic3DApp extends Application {
     }
 
     /**
-     * Updates only the transforms of already-existing joint/link nodes - no new
+     * FAST PATH: updates only the transforms of already-existing joint/link nodes - no new
      * geometry is allocated. Safe to call every animation frame. Only theta/alpha change
      * during playback (link lengths 'a'/'d' stay fixed), so reusing each Cylinder's existing
      * mesh and just repositioning/reorienting it is valid and cheap.
@@ -1085,19 +1006,19 @@ public class kinematic3DApp extends Application {
                 updateRobot3D();
             }
         } catch (Exception e) {
-            showErrorDialog("Import Error", "Failed to load DH table: " + e.getMessage());
+            showErrorDialog("Import Error", STR."Failed to load DH table: \{e.getMessage()}");
         }
     }
 
     private double extractJsonDouble(String jsonObj, String key) {
-        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("\"" + key + "\"\\s*:\\s*([-+]?[0-9]*\\.?[0-9]+)");
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(STR."\"\{key}\"\\s*:\\s*([-+]?[0-9]*\\.?[0-9]+)");
         java.util.regex.Matcher matcher = pattern.matcher(jsonObj);
         return matcher.find() ? Double.parseDouble(matcher.group(1)) : 0.0;
     }
 
     /** Returns the string value for key, or null if absent - used so older exports without "type" still import fine. */
     private String extractJsonString(String jsonObj, String key) {
-        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(STR."\"\{key}\"\\s*:\\s*\"([^\"]*)\"");
         java.util.regex.Matcher matcher = pattern.matcher(jsonObj);
         return matcher.find() ? matcher.group(1) : null;
     }
