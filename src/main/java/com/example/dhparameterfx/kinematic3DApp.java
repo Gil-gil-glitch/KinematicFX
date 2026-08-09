@@ -64,6 +64,26 @@ public class kinematic3DApp extends Application {
     private final List<Cylinder> linkCylinderNodes = new ArrayList<>();
     private Node highlightBoxNode;
 
+    // Joint type tracking. IKSolver/TrajectoryPlanner (not visible to this file) only ever
+    // read/write theta, so this is tracked locally and kept in sync with dhModels at every
+    // mutation site (add/remove/preset/import). true = prismatic (driven by d), false =
+    // revolute (driven by theta).
+    private final List<Boolean> jointIsPrismatic = new ArrayList<>();
+
+    /** Reads whichever DH variable is this joint's driven DOF (theta for revolute, d for prismatic). */
+    private double getJointVar(int i) {
+        return jointIsPrismatic.get(i) ? dhModels.get(i).getD() : dhModels.get(i).getTheta();
+    }
+
+    /** Writes whichever DH variable is this joint's driven DOF (theta for revolute, d for prismatic). */
+    private void setJointVar(int i, double value) {
+        if (jointIsPrismatic.get(i)) {
+            dhModels.get(i).dProperty().set(value);
+        } else {
+            dhModels.get(i).setTheta(value);
+        }
+    }
+
     // Floor / restriction-plane state
     private boolean showFloorPlane = true;
     private static final double FLOOR_EPSILON = 0.05;
@@ -161,6 +181,7 @@ public class kinematic3DApp extends Application {
         dhModels.add(new DHParameterModel(0.0, 90.0, 5.0, 30.0));
         dhModels.add(new DHParameterModel(10.0, 0.0, 0.0, 40.0));
         dhModels.add(new DHParameterModel(8.0, 0.0, 0.0, -25.0));
+        jointIsPrismatic.addAll(List.of(false, false, false));
 
         // Create HUD Overlay
         hud = new MatrixDisplayHUD();
@@ -242,7 +263,6 @@ public class kinematic3DApp extends Application {
         if (transforms.isEmpty() || hud == null) return;
         int idx = Math.max(0, Math.min(selectedJointIndex, transforms.size() - 1));
         hud.update(transforms.get(idx));
-
     }
 
     /**
@@ -267,7 +287,7 @@ public class kinematic3DApp extends Application {
                 double t = (double) s / sampleCount;
                 double[] q = TrajectoryPlanner.interpolateCubic(qStart, qEnd, t);
                 for (int i = 0; i < dhModels.size(); i++) {
-                    dhModels.get(i).setTheta(q[i]);
+                    setJointVar(i, q[i]);
                 }
                 List<Matrix4x4> transforms = computeCurrentTransforms();
                 double[] p = transforms.get(transforms.size() - 1).getPosition();
@@ -276,7 +296,7 @@ public class kinematic3DApp extends Application {
             // Restore the chain to its starting pose - the caller resets to qStart right after
             // this returns, but we leave it consistent either way.
             for (int i = 0; i < dhModels.size(); i++) {
-                dhModels.get(i).setTheta(qStart[i]);
+                setJointVar(i, qStart[i]);
             }
         }
 
@@ -304,34 +324,38 @@ public class kinematic3DApp extends Application {
             return;
         }
 
-        // 1. Capture starting configuration
+        // 1. Capture starting configuration. qStart[i] holds theta for revolute joints, d for
+        // prismatic ones - the "driven DOF" per joint.
         double[] qStart = new double[dhModels.size()];
         for (int i = 0; i < dhModels.size(); i++) {
-            qStart[i] = dhModels.get(i).getTheta();
+            qStart[i] = getJointVar(i);
         }
 
-        // 2. Solve IK (350 iterations, 0.1 tolerance)
-        boolean solved = ikSolver.solve(dhModels, targetPos, 350, 0.1);
+        // 2. Solve IK (350 iterations, 0.1 tolerance). IKSolver now takes jointIsPrismatic
+        // directly, so it builds a proper Jacobian column (and applies updates) against d for
+        // prismatic joints and theta for revolute ones - no post-hoc undo or separate
+        // coordinate-descent pass needed anymore.
+        boolean solved = ikSolver.solve(dhModels, targetPos, 350, 0.1, jointIsPrismatic);
 
         if (!solved) {
             showWarningDialog("Target Unreachable",
                     "The manipulator reached its limit towards the target, but could not match the exact position due to joint constraints.");
             // Reset to start position and abort
             for (int i = 0; i < dhModels.size(); i++) {
-                dhModels.get(i).setTheta(qStart[i]);
+                setJointVar(i, qStart[i]);
             }
             return;
         }
 
-        // 3. Capture end angles after the solver finishes successfully
+        // 3. Capture end configuration after the solver finishes successfully
         double[] qEnd = new double[dhModels.size()];
         for (int i = 0; i < dhModels.size(); i++) {
-            qEnd[i] = dhModels.get(i).getTheta();
+            qEnd[i] = getJointVar(i);
         }
 
         // 4. Reset the models back to the start so we can animate from the beginning
         for (int i = 0; i < dhModels.size(); i++) {
-            dhModels.get(i).setTheta(qStart[i]);
+            setJointVar(i, qStart[i]);
         }
 
         // 5. Compute transforms at the starting pose to define startPos for the straight line
@@ -345,7 +369,7 @@ public class kinematic3DApp extends Application {
         // dhModels may have been left mid-sample by buildPlannedTrail's joint-space preview;
         // guarantee we're sitting at the start pose before animating.
         for (int i = 0; i < dhModels.size(); i++) {
-            dhModels.get(i).setTheta(qStart[i]);
+            setJointVar(i, qStart[i]);
         }
 
         // 7. Stop any existing animation
@@ -376,13 +400,17 @@ public class kinematic3DApp extends Application {
                             Math.max(0.0, startPos[2] + s * (targetPos[2] - startPos[2])) // Floor constraint
                     };
 
-                    // Run a quick 5-iteration IK to track the line on this frame
-                    ikSolver.solve(dhModels, currentTarget, 5, 0.1);
+                    // Run a quick 5-iteration IK to track the line on this frame. Now that
+                    // IKSolver understands jointIsPrismatic, this correctly drives d for
+                    // prismatic joints and theta for revolute ones, frame by frame - no manual
+                    // post-processing needed.
+                    ikSolver.solve(dhModels, currentTarget, 5, 0.1, jointIsPrismatic);
                 } else {
-                    // JOINT SPACE: Interpolate angles directly
+                    // JOINT SPACE: Interpolate the driven variable directly (theta for
+                    // revolute joints, d for prismatic ones)
                     double[] currentQ = TrajectoryPlanner.interpolateCubic(qStart, qEnd, tNorm);
                     for (int i = 0; i < dhModels.size(); i++) {
-                        dhModels.get(i).setTheta(currentQ[i]);
+                        setJointVar(i, currentQ[i]);
                     }
                 }
 
@@ -393,11 +421,11 @@ public class kinematic3DApp extends Application {
                 List<Matrix4x4> frameTransforms = computeCurrentTransforms();
                 if (violatesFloor(frameTransforms)) {
                     for (int i = 0; i < dhModels.size(); i++) {
-                        dhModels.get(i).setTheta(lastGoodQ[i]);
+                        setJointVar(i, lastGoodQ[i]);
                     }
                 } else {
                     for (int i = 0; i < dhModels.size(); i++) {
-                        lastGoodQ[i] = dhModels.get(i).getTheta();
+                        lastGoodQ[i] = getJointVar(i);
                     }
                 }
 
@@ -437,6 +465,7 @@ public class kinematic3DApp extends Application {
         addBtn.setStyle("-fx-background-color: #98c379; -fx-text-fill: #1e1e24; -fx-font-weight: bold;");
         addBtn.setOnAction(e -> {
             dhModels.add(new DHParameterModel(5.0, 0.0, 0.0, 0.0));
+            jointIsPrismatic.add(false);
             selectedJointIndex = dhModels.size() - 1;
             rebuildUIControls();
             updateRobot3D();
@@ -594,10 +623,20 @@ public class kinematic3DApp extends Application {
                 updateRobot3D();
             });
 
-            HBox cardHeader = new HBox();
+            HBox cardHeader = new HBox(10);
             cardHeader.setAlignment(Pos.CENTER_LEFT);
             Label title = new Label("Joint " + (i + 1) + (isSelected ? " (Selected)" : ""));
             title.setStyle("-fx-font-weight: bold; -fx-text-fill: " + (isSelected ? "#61afef" : "#abb2bf") + ";");
+
+            boolean isPrismatic = jointIsPrismatic.get(i);
+            CheckBox prismaticToggle = new CheckBox("Prismatic");
+            prismaticToggle.setSelected(isPrismatic);
+            prismaticToggle.setStyle("-fx-text-fill: #e5c07b; -fx-font-size: 10px;");
+            prismaticToggle.selectedProperty().addListener((o, oldV, newV) -> {
+                jointIsPrismatic.set(index, newV);
+                rebuildUIControls();
+                updateRobot3D();
+            });
 
             Region spacer = new Region();
             HBox.setHgrow(spacer, Priority.ALWAYS);
@@ -607,6 +646,7 @@ public class kinematic3DApp extends Application {
             deleteBtn.setOnAction(e -> {
                 if (dhModels.size() > 1) {
                     dhModels.remove(index);
+                    jointIsPrismatic.remove(index);
                     if (selectedJointIndex >= dhModels.size()) {
                         selectedJointIndex = dhModels.size() - 1;
                     }
@@ -614,6 +654,8 @@ public class kinematic3DApp extends Application {
                     updateRobot3D();
                 }
             });
+
+            cardHeader.getChildren().addAll(title, prismaticToggle, spacer, deleteBtn);
 
             // Inside rebuildUIControls() method of Kinematic3DApp.java
 
@@ -653,7 +695,8 @@ public class kinematic3DApp extends Application {
             HBox dialsRow = new HBox(30);
             dialsRow.setAlignment(Pos.CENTER);
 
-            VBox thetaBox = new VBox(5, new Label("Angle (θ)"), new RotaryDial(model.thetaProperty(), model.getMinTheta(), model.getMaxTheta()));
+            String thetaLabelText = isPrismatic ? "Angle (θ) [fixed]" : "▶ Angle (θ) [driven]";
+            VBox thetaBox = new VBox(5, new Label(thetaLabelText), new RotaryDial(model.thetaProperty(), model.getMinTheta(), model.getMaxTheta()));
             thetaBox.setAlignment(Pos.CENTER);
 
             VBox alphaBox = new VBox(5, new Label("Twist (α)"), new RotaryDial(model.alphaProperty(), -180, 180));
@@ -661,10 +704,12 @@ public class kinematic3DApp extends Application {
 
             dialsRow.getChildren().addAll(thetaBox, alphaBox);
 
+            String dLabelText = isPrismatic ? "▶ d (drive):" : "d (Offset):";
+
             card.getChildren().addAll(
                     cardHeader,
                     createSliderRow("a (Length):", -20, 20, model.aProperty(), false),
-                    createSliderRow("d (Offset):", -20, 20, model.dProperty(), false),
+                    createSliderRow(dLabelText, -20, 20, model.dProperty(), false),
                     dialsRow, // Replaced the two angle sliders with the dual rotary dials
                     limitsRow
             );
@@ -866,12 +911,16 @@ public class kinematic3DApp extends Application {
 
     private void loadScaraPreset() {
         dhModels.clear();
+        jointIsPrismatic.clear();
         // Joint 1: Base turn [-120°, 120°]
         dhModels.add(new DHParameterModel(10.0, 0.0, 0.0, 0.0, -120.0, 120.0));
+        jointIsPrismatic.add(false);
         // Joint 2: Elbow [-110°, 110°] prevents link foldback collision
         dhModels.add(new DHParameterModel(8.0, 180.0, 0.0, 0.0, -110.0, 110.0));
-        // Joint 3: Prismatic translation offset [-90°, 90°]
+        jointIsPrismatic.add(false);
+        // Joint 3: Prismatic translation offset - actually driven by d now, not theta
         dhModels.add(new DHParameterModel(0.0, 0.0, 5.0, 0.0, -90.0, 90.0));
+        jointIsPrismatic.add(true);
         selectedJointIndex = 0;
         rebuildUIControls();
         updateRobot3D();
@@ -879,12 +928,14 @@ public class kinematic3DApp extends Application {
 
     private void loadPuma560Preset() {
         dhModels.clear();
+        jointIsPrismatic.clear();
         dhModels.add(new DHParameterModel(0.0, -90.0, 0.0, 0.0, -160.0, 160.0));
         dhModels.add(new DHParameterModel(8.0, 0.0, 0.0, -30.0, -120.0, 120.0));
         dhModels.add(new DHParameterModel(2.0, 90.0, 0.0, 45.0, -135.0, 135.0));
         dhModels.add(new DHParameterModel(0.0, -90.0, 8.0, 0.0, -140.0, 140.0));
         dhModels.add(new DHParameterModel(0.0, 90.0, 0.0, 30.0, -100.0, 100.0));
         dhModels.add(new DHParameterModel(0.0, 0.0, 2.0, 0.0, -180.0, 180.0));
+        jointIsPrismatic.addAll(List.of(false, false, false, false, false, false));
         selectedJointIndex = 0;
         rebuildUIControls();
         updateRobot3D();
@@ -902,8 +953,9 @@ public class kinematic3DApp extends Application {
         StringBuilder json = new StringBuilder("[\n");
         for (int i = 0; i < dhModels.size(); i++) {
             DHParameterModel model = dhModels.get(i);
-            json.append(String.format("  { \"a\": %.4f, \"alpha\": %.4f, \"d\": %.4f, \"theta\": %.4f }",
-                    model.getA(), model.getAlpha(), model.getD(), model.getTheta()));
+            String type = jointIsPrismatic.get(i) ? "prismatic" : "revolute";
+            json.append(String.format("  { \"a\": %.4f, \"alpha\": %.4f, \"d\": %.4f, \"theta\": %.4f, \"type\": \"%s\" }",
+                    model.getA(), model.getAlpha(), model.getD(), model.getTheta(), type));
             if (i < dhModels.size() - 1) json.append(",");
             json.append("\n");
         }
@@ -931,6 +983,7 @@ public class kinematic3DApp extends Application {
             }
 
             List<DHParameterModel> newModels = new ArrayList<>();
+            List<Boolean> newTypes = new ArrayList<>();
             String inner = content.substring(1, content.length() - 1).trim();
             String[] objects = inner.split("(?<=\\}),\\s*(?=\\{)");
 
@@ -940,24 +993,34 @@ public class kinematic3DApp extends Application {
                 double d = extractJsonDouble(objStr, "d");
                 double theta = extractJsonDouble(objStr, "theta");
                 newModels.add(new DHParameterModel(a, alpha, d, theta));
+                newTypes.add("prismatic".equals(extractJsonString(objStr, "type")));
             }
 
             if (!newModels.isEmpty()) {
                 dhModels.clear();
                 dhModels.addAll(newModels);
+                jointIsPrismatic.clear();
+                jointIsPrismatic.addAll(newTypes);
                 selectedJointIndex = 0;
                 rebuildUIControls();
                 updateRobot3D();
             }
         } catch (Exception e) {
-            showErrorDialog("Import Error", "Failed to load DH table: " + e.getMessage());
+            showErrorDialog("Import Error", STR."Failed to load DH table: \{e.getMessage()}");
         }
     }
 
     private double extractJsonDouble(String jsonObj, String key) {
-        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("\"" + key + "\"\\s*:\\s*([-+]?[0-9]*\\.?[0-9]+)");
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(STR."\"\{key}\"\\s*:\\s*([-+]?[0-9]*\\.?[0-9]+)");
         java.util.regex.Matcher matcher = pattern.matcher(jsonObj);
         return matcher.find() ? Double.parseDouble(matcher.group(1)) : 0.0;
+    }
+
+    /** Returns the string value for key, or null if absent - used so older exports without "type" still import fine. */
+    private String extractJsonString(String jsonObj, String key) {
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(STR."\"\{key}\"\\s*:\\s*\"([^\"]*)\"");
+        java.util.regex.Matcher matcher = pattern.matcher(jsonObj);
+        return matcher.find() ? matcher.group(1) : null;
     }
 
     private void showErrorDialog(String title, String message) {
