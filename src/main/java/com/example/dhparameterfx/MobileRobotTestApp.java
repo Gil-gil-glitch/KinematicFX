@@ -53,9 +53,16 @@ public class MobileRobotTestApp extends Application {
     private Label selfTestLabel;
     private Label ioStatusLabel;
 
-    private boolean driveToTargetMode = false;
-    private double targetX = 0, targetY = 0;
-    private final Sphere targetMarker = new Sphere(0.3 * SCALE / 10.0);
+    // Multi-waypoint path following (pure pursuit), replacing the old
+    // single-goal drive-to-target as the actual driver of motion.
+    private final PurePursuitController pathController = new PurePursuitController();
+    private final List<PurePursuitController.Waypoint> path = new ArrayList<>();
+    private int pathTargetIndex = 0;
+    private boolean followingPath = false;
+    private final Group pathVisualGroup = new Group();
+    private static final double LOOKAHEAD_DISTANCE = 2.5; // pose units
+    private static final double PATH_DESIRED_SPEED = 4.0; // units/s
+    private static final double PATH_GOAL_TOLERANCE = 0.3; // pose units
 
     private SubScene subScene;
     private OrbitCamera cameraRig;
@@ -84,6 +91,9 @@ public class MobileRobotTestApp extends Application {
         trailGroup.setMouseTransparent(true);
         world.getChildren().add(trailGroup);
 
+        pathVisualGroup.setMouseTransparent(true);
+        world.getChildren().add(pathVisualGroup);
+
         // robotVisual carries the pose transform each frame (see
         // updateRobotVisualTransform). robotGeometryGroup holds the
         // rebuildable chassis/wheel/arrow meshes; fpvCamera is a *separate*
@@ -106,10 +116,6 @@ public class MobileRobotTestApp extends Application {
 
         world.getChildren().add(robotVisual);
 
-        targetMarker.setMaterial(new PhongMaterial(Color.web("#e5c07b")));
-        targetMarker.setVisible(false);
-        world.getChildren().add(targetMarker);
-
         AmbientLight ambient = new AmbientLight(Color.color(0.45, 0.45, 0.45));
         PointLight light = new PointLight(Color.WHITE);
         light.setTranslateX(-30);
@@ -121,13 +127,21 @@ public class MobileRobotTestApp extends Application {
             PickResult pr = e.getPickResult();
             if (pr.getIntersectedNode() == floorPlane) {
                 Point3D p = pr.getIntersectedPoint();
-                targetX = p.getX() / SCALE;
-                targetY = p.getZ() / SCALE;
-                driveToTargetMode = true;
-                targetMarker.setTranslateX(p.getX());
-                targetMarker.setTranslateY(0);
-                targetMarker.setTranslateZ(p.getZ());
-                targetMarker.setVisible(true);
+                double px = p.getX() / SCALE;
+                double py = p.getZ() / SCALE;
+
+                path.add(new PurePursuitController.Waypoint(px, py));
+                rebuildPathVisual();
+
+                // Clicking always extends the queue; if nothing is currently
+                // being followed, start immediately from wherever the robot
+                // is now. This keeps a single click behaving like the old
+                // one-shot "drive to target" while extra clicks naturally
+                // become a multi-waypoint path instead of overwriting it.
+                if (!followingPath) {
+                    followingPath = true;
+                    pathTargetIndex = 0;
+                }
             }
         });
 
@@ -226,6 +240,48 @@ public class MobileRobotTestApp extends Application {
         }
     }
 
+    /**
+     * Redraws the planned-path markers (waypoint dots + connecting
+     * segments) whenever the queue changes. This is the "planned" path,
+     * distinct in color from {@link #trailGroup}'s green "actually driven"
+     * dots, so you can visually compare the pure-pursuit-followed route
+     * against the intended clicked path.
+     */
+    private void rebuildPathVisual() {
+        pathVisualGroup.getChildren().clear();
+
+        for (PurePursuitController.Waypoint w : path) {
+            Sphere marker = new Sphere(0.4);
+            marker.setMaterial(new PhongMaterial(Color.web("#e5c07b")));
+            marker.setTranslateX(w.x() * SCALE);
+            marker.setTranslateY(0);
+            marker.setTranslateZ(w.y() * SCALE);
+            pathVisualGroup.getChildren().add(marker);
+        }
+
+        for (int i = 1; i < path.size(); i++) {
+            PurePursuitController.Waypoint a = path.get(i - 1);
+            PurePursuitController.Waypoint b = path.get(i);
+            pathVisualGroup.getChildren().add(buildSegment(
+                    a.x() * SCALE, a.y() * SCALE, b.x() * SCALE, b.y() * SCALE));
+        }
+    }
+
+    /** Thin flat box laid between two floor points, used to draw the planned-path line. */
+    private Box buildSegment(double x1, double z1, double x2, double z2) {
+        double dx = x2 - x1;
+        double dz = z2 - z1;
+        double length = Math.hypot(dx, dz);
+
+        Box segment = new Box(Math.max(length, 0.01), 0.1, 0.3);
+        segment.setMaterial(new PhongMaterial(Color.web("#e5c07b", 0.7)));
+        segment.setTranslateX((x1 + x2) / 2.0);
+        segment.setTranslateY(0.1);
+        segment.setTranslateZ((z1 + z2) / 2.0);
+        segment.getTransforms().add(new Rotate(-Math.toDegrees(Math.atan2(dz, dx)), Rotate.Y_AXIS));
+        return segment;
+    }
+
     // ---------------------------------------------------------------
     // Animation loop
     // ---------------------------------------------------------------
@@ -244,14 +300,15 @@ public class MobileRobotTestApp extends Application {
                 double v;
                 double omega;
 
-                if (driveToTargetMode) {
-                    double[] cmd = goToGoalController();
-                    v = cmd[0];
-                    omega = cmd[1];
-                    double dx = targetX - robot.getPose().x();
-                    double dy = targetY - robot.getPose().y();
-                    if (Math.hypot(dx, dy) < 0.3) {
-                        driveToTargetMode = false;
+                if (followingPath && !path.isEmpty()) {
+                    PurePursuitController.Command cmd = pathController.computeCommand(
+                            robot.getPose(), path, pathTargetIndex,
+                            LOOKAHEAD_DISTANCE, PATH_DESIRED_SPEED, PATH_GOAL_TOLERANCE);
+                    v = cmd.v();
+                    omega = cmd.omega();
+                    pathTargetIndex = cmd.targetIndex();
+                    if (cmd.pathComplete()) {
+                        followingPath = false;
                     }
                 } else {
                     v = teleopV.getValue();
@@ -272,42 +329,18 @@ public class MobileRobotTestApp extends Application {
         timer.start();
     }
 
-    /** Simple proportional go-to-goal unicycle controller: turn toward the goal, then drive. */
-    private double[] goToGoalController() {
-        Pose2D pose = robot.getPose();
-        double dx = targetX - pose.x();
-        double dy = targetY - pose.y();
-        double dist = Math.hypot(dx, dy);
-
-        double desiredHeading = Math.atan2(dy, dx);
-        double headingErr = normalizeAngleRad(desiredHeading - pose.thetaRad());
-
-        double kV = 1.2, kW = 2.5;
-        double v = Math.min(4.0, kV * dist);
-        // Slow down the forward speed while turning to face the goal, like a real go-to-goal controller.
-        v *= Math.max(0.0, 1.0 - Math.abs(headingErr) / Math.PI);
-        double omega = kW * headingErr;
-
-        return new double[]{v, omega};
-    }
-
-    private double normalizeAngleRad(double a) {
-        while (a > Math.PI) a -= 2 * Math.PI;
-        while (a < -Math.PI) a += 2 * Math.PI;
-        return a;
-    }
-
     private void updateHud() {
         Pose2D pose = robot.getPose();
+        String mode = followingPath
+                ? String.format("following path (waypoint %d/%d)", pathTargetIndex + 1, path.size())
+                : "teleop";
         hudLabel.setText(String.format(
                 "x: %6.2f   y: %6.2f   theta: %6.1f deg%n" +
                         "wheel L: %5.2f rad/s   wheel R: %5.2f rad/s%n" +
                         "mode: %s",
                 pose.x(), pose.y(), pose.thetaDeg(),
                 robot.getLeftWheelSpeed(), robot.getRightWheelSpeed(),
-                driveToTargetMode
-                        ? String.format("drive-to-target (%.1f, %.1f)", targetX, targetY)
-                        : "teleop"
+                mode
         ));
     }
 
@@ -346,6 +379,14 @@ public class MobileRobotTestApp extends Application {
                     worst, posDrift));
             selfTestLabel.setStyle("-fx-text-fill: #e5c07b; -fx-font-size: 11px; -fx-font-weight: bold;");
         }
+    }
+
+    /** Cancels path-following, clears the queued waypoints, and removes their visuals. */
+    private void clearPath() {
+        followingPath = false;
+        pathTargetIndex = 0;
+        path.clear();
+        pathVisualGroup.getChildren().clear();
     }
 
     // ---------------------------------------------------------------
@@ -390,8 +431,7 @@ public class MobileRobotTestApp extends Application {
             repositionFpvCamera();
             updateRobotVisualTransform();
             trailGroup.getChildren().clear();
-            driveToTargetMode = false;
-            targetMarker.setVisible(false);
+            clearPath();
 
             setIoStatus("\u2713 Loaded " + file.getName(), true);
         } catch (Exception e) {
@@ -443,14 +483,13 @@ public class MobileRobotTestApp extends Application {
         HBox teleopVRow = sliderRow("v (units/s):", teleopV);
         HBox teleopOmegaRow = sliderRow("\u03C9 (rad/s):", teleopOmega);
 
-        Button stopBtn = new Button("Stop / cancel drive-to-target");
+        Button stopBtn = new Button("Stop / clear path");
         stopBtn.setMaxWidth(Double.MAX_VALUE);
         stopBtn.setStyle("-fx-background-color: #e06c75; -fx-text-fill: white; -fx-font-weight: bold;");
         stopBtn.setOnAction(e -> {
-            driveToTargetMode = false;
+            clearPath();
             teleopV.setValue(0);
             teleopOmega.setValue(0);
-            targetMarker.setVisible(false);
         });
 
         Button cameraToggleBtn = new Button("Switch to 1st-person camera");
@@ -462,7 +501,8 @@ public class MobileRobotTestApp extends Application {
             cameraToggleBtn.setText(fpvActive ? "Switch to orbit camera" : "Switch to 1st-person camera");
         });
 
-        Label hintLabel = new Label("Click the floor to drive there (go-to-goal controller).");
+        Label hintLabel = new Label("Click the floor to queue a waypoint — following starts automatically, " +
+                "and further clicks extend the path (pure-pursuit curvature control, not point-and-snap).");
         hintLabel.setWrapText(true);
         hintLabel.setStyle("-fx-font-size: 11px; -fx-text-fill: #abb2bf;");
 
@@ -472,8 +512,7 @@ public class MobileRobotTestApp extends Application {
         resetBtn.setOnAction(e -> {
             robot.setPose(Pose2D.origin());
             trailGroup.getChildren().clear();
-            driveToTargetMode = false;
-            targetMarker.setVisible(false);
+            clearPath();
         });
 
         Button selfTestBtn = new Button("Run kinematics self-test");
