@@ -15,6 +15,7 @@
     </properties>
 
     <dependencies>
+
         <dependency>
             <groupId>org.openjfx</groupId>
             <artifactId>javafx-controls</artifactId>
@@ -124,6 +125,21 @@
                     <target>21</target>
                     <compilerArgs>--enable-preview</compilerArgs>
                 </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+                <!--
+                    Needed so `mvn test` actually discovers and runs the
+                    JUnit 5 (Jupiter) tests, e.g. DifferentialDriveKinematicsTest
+                    and MobileRobotConfigIOTest. The plugin auto-detects the
+                    JUnit Platform once junit-jupiter-engine is on the test
+                    classpath (already declared above) - this just pins a
+                    modern-enough Surefire version to make sure that
+                    detection actually works, since Maven's default bundled
+                    Surefire can be too old to see JUnit 5 tests at all.
+                -->
             </plugin>
             <plugin>
                 <groupId>org.openjfx</groupId>
