@@ -7,6 +7,8 @@ import javafx.geometry.Point3D;
 import javafx.geometry.Pos;
 import javafx.scene.*;
 import javafx.scene.control.*;
+import javafx.scene.image.PixelWriter;
+import javafx.scene.image.WritableImage;
 import javafx.scene.input.PickResult;
 import javafx.scene.layout.*;
 import javafx.scene.paint.Color;
@@ -67,7 +69,10 @@ public class MobileRobotTestApp extends Application {
     private SubScene subScene;
     private OrbitCamera cameraRig;
     private PerspectiveCamera fpvCamera;
-    private boolean fpvActive = false;
+    private PerspectiveCamera topDownCamera;
+    private enum CameraMode { ORBIT, FPV, TOP_DOWN }
+    private CameraMode cameraMode = CameraMode.ORBIT;
+    private static final double TOP_DOWN_HEIGHT = 220.0; // world units above ground (negative Y = up in this scene)
     private Stage primaryStage;
 
     private AnimationTimer timer;
@@ -113,6 +118,24 @@ public class MobileRobotTestApp extends Application {
         fpvCamera.setTranslateX(robot.getWheelRadius() * SCALE / 10.0 * 0.6);
         fpvCamera.setTranslateY(-robot.getWheelRadius() * SCALE / 10.0 * 1.6);
         robotVisual.getChildren().add(fpvCamera);
+
+        // Top-down preset: a bird's-eye view for judging the driven trail
+        // and planned path against each other, and for keeping the whole
+        // arena in frame while path-following. Deliberately a child of
+        // `world`, not `robotVisual` — it should NOT inherit the chassis's
+        // heading rotation (that would spin the whole view every time the
+        // robot turns); only its X/Z position is updated each frame in
+        // startLoop() to follow the robot while staying north-up.
+        topDownCamera = new PerspectiveCamera(true);
+        topDownCamera.setNearClip(1.0);
+        topDownCamera.setFarClip(2000);
+        topDownCamera.setFieldOfView(50);
+        // Default forward is +Z; rotate -90 about X so it looks straight
+        // down (+Y in this scene's "negative-Y-is-up" convention — see the
+        // TOP_DOWN_HEIGHT field comment).
+        topDownCamera.getTransforms().add(new Rotate(-90, Rotate.X_AXIS));
+        topDownCamera.setTranslateY(-TOP_DOWN_HEIGHT);
+        world.getChildren().add(topDownCamera);
 
         world.getChildren().add(robotVisual);
 
@@ -169,10 +192,63 @@ public class MobileRobotTestApp extends Application {
 
     private Box buildFloorPlane(double extent, double gridSpacing) {
         Box floor = new Box(extent, 0.4, extent);
-        PhongMaterial mat = new PhongMaterial(Color.web("#2b2b36"));
+        PhongMaterial mat = new PhongMaterial(Color.WHITE); // white so the texture's own colors show unmodified
+        mat.setDiffuseMap(buildFloorTexture(extent, gridSpacing));
         floor.setMaterial(mat);
         floor.setTranslateY(0.2);
         return floor;
+    }
+
+    /**
+     * Procedurally generates a checkerboard-plus-coarse-grid texture for the
+     * floor. A flat solid color gives an FPV/driver-seat camera almost no
+     * motion cues — no texture flow, no parallax, no way to judge speed or
+     * heading drift from the ground plane alone. A fine checker pattern
+     * restores that (each square passing through frame gives a concrete
+     * speed/direction cue), and a coarser bright grid on top of it gives a
+     * fixed distance reference (like lane markings) so scale is legible
+     * from both the orbit and top-down views, not just up close.
+     * <p>
+     * Baked as one image sized so the checker squares line up with
+     * {@code gridSpacing} world units, rather than relying on JavaFX's
+     * texture-repeat support (Box UV mapping stretches one image per face
+     * with no built-in tiling), so the pattern reads correctly at the
+     * floor's actual scale without any extra scene-graph nodes.
+     */
+    private WritableImage buildFloorTexture(double extent, double gridSpacing) {
+        int pixelsPerSquare = 16;
+        int squaresPerSide = (int) Math.round(extent / gridSpacing);
+        int imageSize = pixelsPerSquare * squaresPerSide;
+
+        WritableImage image = new WritableImage(imageSize, imageSize);
+        PixelWriter writer = image.getPixelWriter();
+
+        Color squareA = Color.web("#2b2b36");
+        Color squareB = Color.web("#33333f");
+        Color coarseLine = Color.web("#61afef", 0.55);
+        int coarseLineEveryNSquares = 5;
+        int coarseLineThicknessPx = 2;
+
+        for (int py = 0; py < imageSize; py++) {
+            int squareRow = py / pixelsPerSquare;
+            for (int px = 0; px < imageSize; px++) {
+                int squareCol = px / pixelsPerSquare;
+
+                boolean onCoarseLine =
+                        (squareCol % coarseLineEveryNSquares == 0 && px % pixelsPerSquare < coarseLineThicknessPx) ||
+                                (squareRow % coarseLineEveryNSquares == 0 && py % pixelsPerSquare < coarseLineThicknessPx);
+
+                Color color;
+                if (onCoarseLine) {
+                    color = coarseLine;
+                } else {
+                    color = ((squareRow + squareCol) % 2 == 0) ? squareA : squareB;
+                }
+                writer.setColor(px, py, color);
+            }
+        }
+
+        return image;
     }
 
     private void buildRobotVisual() {
@@ -318,6 +394,12 @@ public class MobileRobotTestApp extends Application {
                 robot.step(v, omega, dt);
                 updateRobotVisualTransform();
 
+                if (cameraMode == CameraMode.TOP_DOWN) {
+                    Pose2D pose = robot.getPose();
+                    topDownCamera.setTranslateX(pose.x() * SCALE);
+                    topDownCamera.setTranslateZ(pose.y() * SCALE);
+                }
+
                 frameCounter++;
                 if (frameCounter % 4 == 0) {
                     addTrailMarker();
@@ -368,15 +450,33 @@ public class MobileRobotTestApp extends Application {
         Pose2D afterRotation = k.integrate(start, 0.0, 1.2, 0.5);
         double posDrift = Math.hypot(afterRotation.x() - start.x(), afterRotation.y() - start.y());
 
-        if (worst < 1e-9 && posDrift < 1e-9) {
+        // Constant-curvature arc closure: drive a full circle at constant
+        // (v, omega) in small simulated steps (matching how the real
+        // animation loop calls integrate() every frame, not one giant dt)
+        // and confirm the exact-arc integration returns to the start pose
+        // with no accumulated drift — the in-app counterpart to
+        // DifferentialDriveKinematicsTest.constantCurvatureArc_returnsToStartAfterOneFullTurn.
+        double arcV = 3.0, arcOmega = 1.0;
+        double period = 2 * Math.PI / arcOmega;
+        Pose2D arcPose = new Pose2D(0, 0, 0);
+        Pose2D arcStart = arcPose;
+        int arcSteps = 720;
+        double arcDt = period / arcSteps;
+        for (int i = 0; i < arcSteps; i++) {
+            arcPose = k.integrate(arcPose, arcV, arcOmega, arcDt);
+        }
+        double arcDrift = Math.hypot(arcPose.x() - arcStart.x(), arcPose.y() - arcStart.y());
+
+        if (worst < 1e-9 && posDrift < 1e-9 && arcDrift < 1e-3) {
             selfTestLabel.setText(String.format(
-                    "\u2713 Inverse/forward kinematics round-trip OK (max err %.2e), pure rotation has zero position drift.",
-                    worst));
+                    "\u2713 Round-trip OK (err %.2e), pure rotation has zero drift, " +
+                            "and a full-circle arc closes within %.4f units.",
+                    worst, arcDrift));
             selfTestLabel.setStyle("-fx-text-fill: #98c379; -fx-font-size: 11px; -fx-font-weight: bold;");
         } else {
             selfTestLabel.setText(String.format(
-                    "\u26A0 Round-trip error %.2e, rotation drift %.2e — check kinematics signs/units.",
-                    worst, posDrift));
+                    "\u26A0 Round-trip error %.2e, rotation drift %.2e, arc-closure drift %.4f — check kinematics signs/units.",
+                    worst, posDrift, arcDrift));
             selfTestLabel.setStyle("-fx-text-fill: #e5c07b; -fx-font-size: 11px; -fx-font-weight: bold;");
         }
     }
@@ -496,9 +596,35 @@ public class MobileRobotTestApp extends Application {
         cameraToggleBtn.setMaxWidth(Double.MAX_VALUE);
         cameraToggleBtn.setStyle("-fx-background-color: #c678dd; -fx-text-fill: white; -fx-font-weight: bold;");
         cameraToggleBtn.setOnAction(e -> {
-            fpvActive = !fpvActive;
-            subScene.setCamera(fpvActive ? fpvCamera : cameraRig.getCamera());
-            cameraToggleBtn.setText(fpvActive ? "Switch to orbit camera" : "Switch to 1st-person camera");
+            cameraMode = switch (cameraMode) {
+                case ORBIT -> CameraMode.FPV;
+                case FPV -> CameraMode.TOP_DOWN;
+                case TOP_DOWN -> CameraMode.ORBIT;
+            };
+
+            Camera activeCamera = switch (cameraMode) {
+                case ORBIT -> cameraRig.getCamera();
+                case FPV -> fpvCamera;
+                case TOP_DOWN -> topDownCamera;
+            };
+            subScene.setCamera(activeCamera);
+
+            if (cameraMode == CameraMode.TOP_DOWN) {
+                // Snap to the robot's current position immediately rather
+                // than waiting for the next animation frame, so switching
+                // views doesn't briefly show wherever the camera was last
+                // parked (e.g. the origin, if the robot has since driven
+                // away from it).
+                Pose2D pose = robot.getPose();
+                topDownCamera.setTranslateX(pose.x() * SCALE);
+                topDownCamera.setTranslateZ(pose.y() * SCALE);
+            }
+
+            cameraToggleBtn.setText(switch (cameraMode) {
+                case ORBIT -> "Switch to 1st-person camera";
+                case FPV -> "Switch to top-down camera";
+                case TOP_DOWN -> "Switch to orbit camera";
+            });
         });
 
         Label hintLabel = new Label("Click the floor to queue a waypoint — following starts automatically, " +
