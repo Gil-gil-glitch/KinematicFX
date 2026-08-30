@@ -41,6 +41,7 @@ public class MobileRobotTestApp extends Application {
 
     private final Group world = new Group();
     private final Group robotVisual = new Group();
+    private final Group robotGeometryGroup = new Group();
     private final Group trailGroup = new Group();
     private Box floorPlane;
 
@@ -51,6 +52,11 @@ public class MobileRobotTestApp extends Application {
     private double targetX = 0, targetY = 0;
     private final Sphere targetMarker = new Sphere(0.3 * SCALE / 10.0);
 
+    private SubScene subScene;
+    private OrbitCamera cameraRig;
+    private PerspectiveCamera fpvCamera;
+    private boolean fpvActive = false;
+
     private AnimationTimer timer;
     private long lastNanos = -1;
     private int frameCounter = 0;
@@ -58,10 +64,10 @@ public class MobileRobotTestApp extends Application {
     @Override
     public void start(Stage stage) {
 
-        SubScene subScene = new SubScene(world, 800, 700, true, SceneAntialiasing.BALANCED);
+        subScene = new SubScene(world, 800, 700, true, SceneAntialiasing.BALANCED);
         subScene.setFill(Color.web("#1e1e24"));
 
-        OrbitCamera cameraRig = new OrbitCamera();
+        cameraRig = new OrbitCamera();
         subScene.setCamera(cameraRig.getCamera());
         world.getChildren().add(cameraRig.getRootNode());
 
@@ -71,7 +77,26 @@ public class MobileRobotTestApp extends Application {
         trailGroup.setMouseTransparent(true);
         world.getChildren().add(trailGroup);
 
+        // robotVisual carries the pose transform each frame (see
+        // updateRobotVisualTransform). robotGeometryGroup holds the
+        // rebuildable chassis/wheel/arrow meshes; fpvCamera is a *separate*
+        // permanent child so buildRobotVisual()'s clear-and-rebuild (on
+        // wheel-radius/track-width changes) never removes the camera.
         buildRobotVisual();
+        robotVisual.getChildren().add(robotGeometryGroup);
+
+        fpvCamera = new PerspectiveCamera(true);
+        fpvCamera.setNearClip(0.05);
+        fpvCamera.setFarClip(2000);
+        fpvCamera.setFieldOfView(75);
+        // Camera's default forward is local +Z; rotate 90 deg about Y so it
+        // looks down local +X, which is this robot's forward axis (see the
+        // convention note in buildRobotVisual/updateRobotVisualTransform).
+        fpvCamera.getTransforms().add(new Rotate(90, Rotate.Y_AXIS));
+        fpvCamera.setTranslateX(robot.getWheelRadius() * SCALE / 10.0 * 0.6);
+        fpvCamera.setTranslateY(-robot.getWheelRadius() * SCALE / 10.0 * 1.6);
+        robotVisual.getChildren().add(fpvCamera);
+
         world.getChildren().add(robotVisual);
 
         targetMarker.setMaterial(new PhongMaterial(Color.web("#e5c07b")));
@@ -130,7 +155,7 @@ public class MobileRobotTestApp extends Application {
     }
 
     private void buildRobotVisual() {
-        robotVisual.getChildren().clear();
+        robotGeometryGroup.getChildren().clear();
 
         double r = robot.getWheelRadius() * SCALE / 10.0;
         double trackW = robot.getTrackWidth() * SCALE / 10.0;
@@ -163,7 +188,15 @@ public class MobileRobotTestApp extends Application {
         headingArrow.setTranslateX(r * 1.6);
         headingArrow.setTranslateY(-r * 0.3);
 
-        robotVisual.getChildren().addAll(chassis, leftWheel, rightWheel, headingArrow);
+        robotGeometryGroup.getChildren().addAll(chassis, leftWheel, rightWheel, headingArrow);
+    }
+
+    /** Re-derives the FPV camera's mount offset from the current wheel radius. */
+    private void repositionFpvCamera() {
+        if (fpvCamera == null) return;
+        double r = robot.getWheelRadius() * SCALE / 10.0;
+        fpvCamera.setTranslateX(r * 0.6);
+        fpvCamera.setTranslateY(-r * 1.6);
     }
 
     private void updateRobotVisualTransform() {
@@ -333,7 +366,10 @@ public class MobileRobotTestApp extends Application {
 
         wheelRadiusRow.getChildren().get(1).setOnMouseReleased(e -> buildRobotVisual());
         // Rebuild the visual whenever geometry properties change, not just on release.
-        robot.wheelRadiusProperty().addListener((o, ov, nv) -> buildRobotVisual());
+        robot.wheelRadiusProperty().addListener((o, ov, nv) -> {
+            buildRobotVisual();
+            repositionFpvCamera();
+        });
         robot.trackWidthProperty().addListener((o, ov, nv) -> buildRobotVisual());
 
         Label teleopLabel = new Label("Teleop (used when not driving to a target):");
@@ -352,6 +388,15 @@ public class MobileRobotTestApp extends Application {
             teleopV.setValue(0);
             teleopOmega.setValue(0);
             targetMarker.setVisible(false);
+        });
+
+        Button cameraToggleBtn = new Button("Switch to 1st-person camera");
+        cameraToggleBtn.setMaxWidth(Double.MAX_VALUE);
+        cameraToggleBtn.setStyle("-fx-background-color: #c678dd; -fx-text-fill: white; -fx-font-weight: bold;");
+        cameraToggleBtn.setOnAction(e -> {
+            fpvActive = !fpvActive;
+            subScene.setCamera(fpvActive ? fpvCamera : cameraRig.getCamera());
+            cameraToggleBtn.setText(fpvActive ? "Switch to orbit camera" : "Switch to 1st-person camera");
         });
 
         Label hintLabel = new Label("Click the floor to drive there (go-to-goal controller).");
@@ -386,7 +431,7 @@ public class MobileRobotTestApp extends Application {
                 header,
                 chassisLabel, wheelRadiusRow, trackWidthRow, maxSpeedRow,
                 new Separator(),
-                teleopLabel, teleopVRow, teleopOmegaRow, stopBtn, hintLabel,
+                teleopLabel, teleopVRow, teleopOmegaRow, stopBtn, cameraToggleBtn, hintLabel,
                 new Separator(),
                 resetBtn, selfTestBtn, selfTestLabel,
                 new Separator(),
