@@ -16,8 +16,12 @@ import javafx.scene.shape.Cylinder;
 import javafx.scene.shape.Sphere;
 import javafx.scene.transform.Rotate;
 import javafx.scene.transform.Translate;
+import javafx.stage.FileChooser;
 import javafx.stage.Stage;
 
+import java.io.File;
+import java.io.PrintWriter;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -47,6 +51,7 @@ public class MobileRobotTestApp extends Application {
 
     private Label hudLabel;
     private Label selfTestLabel;
+    private Label ioStatusLabel;
 
     private boolean driveToTargetMode = false;
     private double targetX = 0, targetY = 0;
@@ -56,6 +61,7 @@ public class MobileRobotTestApp extends Application {
     private OrbitCamera cameraRig;
     private PerspectiveCamera fpvCamera;
     private boolean fpvActive = false;
+    private Stage primaryStage;
 
     private AnimationTimer timer;
     private long lastNanos = -1;
@@ -64,6 +70,7 @@ public class MobileRobotTestApp extends Application {
     @Override
     public void start(Stage stage) {
 
+        this.primaryStage = stage;
         subScene = new SubScene(world, 800, 700, true, SceneAntialiasing.BALANCED);
         subScene.setFill(Color.web("#1e1e24"));
 
@@ -342,6 +349,62 @@ public class MobileRobotTestApp extends Application {
     }
 
     // ---------------------------------------------------------------
+    // Persistence (chassis config + pose), mirroring kinematic3DApp's
+    // exportToJson/importFromJson pattern. The actual JSON read/write logic
+    // lives in MobileRobotConfigIO so it stays unit-testable without a
+    // FileChooser/Stage; this method is just the UI glue.
+    // ---------------------------------------------------------------
+
+    private void exportConfigToJson() {
+        FileChooser fileChooser = new FileChooser();
+        fileChooser.setTitle("Export Mobile Robot Config to JSON");
+        fileChooser.getExtensionFilters().add(new FileChooser.ExtensionFilter("JSON Files (*.json)", "*.json"));
+        fileChooser.setInitialFileName("mobile_robot_config.json");
+
+        File file = fileChooser.showSaveDialog(primaryStage);
+        if (file == null) return;
+
+        try (PrintWriter writer = new PrintWriter(file)) {
+            MobileRobotConfigIO.MobileRobotConfig config = MobileRobotConfigIO.fromModel(robot);
+            writer.write(MobileRobotConfigIO.toJson(config));
+            setIoStatus("\u2713 Saved to " + file.getName(), true);
+        } catch (Exception e) {
+            setIoStatus("Export failed: " + e.getMessage(), false);
+        }
+    }
+
+    private void importConfigFromJson() {
+        FileChooser fileChooser = new FileChooser();
+        fileChooser.setTitle("Import Mobile Robot Config from JSON");
+        fileChooser.getExtensionFilters().add(new FileChooser.ExtensionFilter("JSON Files (*.json)", "*.json"));
+
+        File file = fileChooser.showOpenDialog(primaryStage);
+        if (file == null) return;
+
+        try {
+            String content = Files.readString(file.toPath());
+            MobileRobotConfigIO.MobileRobotConfig config = MobileRobotConfigIO.fromJson(content);
+            MobileRobotConfigIO.applyTo(robot, config);
+
+            buildRobotVisual();
+            repositionFpvCamera();
+            updateRobotVisualTransform();
+            trailGroup.getChildren().clear();
+            driveToTargetMode = false;
+            targetMarker.setVisible(false);
+
+            setIoStatus("\u2713 Loaded " + file.getName(), true);
+        } catch (Exception e) {
+            setIoStatus("Import failed: " + e.getMessage(), false);
+        }
+    }
+
+    private void setIoStatus(String text, boolean success) {
+        ioStatusLabel.setText(text);
+        ioStatusLabel.setStyle("-fx-font-size: 11px; -fx-text-fill: " + (success ? "#98c379" : "#e06c75") + ";");
+    }
+
+    // ---------------------------------------------------------------
     // Control panel
     // ---------------------------------------------------------------
 
@@ -422,6 +485,28 @@ public class MobileRobotTestApp extends Application {
         selfTestLabel.setWrapText(true);
         selfTestLabel.setMaxWidth(300);
 
+        Label fileLabel = new Label("File I/O:");
+        fileLabel.setStyle("-fx-font-size: 11px; -fx-text-fill: #abb2bf; -fx-font-weight: bold;");
+
+        HBox fileBar = new HBox(8);
+        Button exportBtn = new Button("Export JSON");
+        exportBtn.setMaxWidth(Double.MAX_VALUE);
+        HBox.setHgrow(exportBtn, Priority.ALWAYS);
+        exportBtn.setStyle("-fx-background-color: #3b3b4d; -fx-text-fill: #98c379; -fx-border-color: #98c379; -fx-border-radius: 3;");
+        exportBtn.setOnAction(e -> exportConfigToJson());
+
+        Button importBtn = new Button("Import JSON");
+        importBtn.setMaxWidth(Double.MAX_VALUE);
+        HBox.setHgrow(importBtn, Priority.ALWAYS);
+        importBtn.setStyle("-fx-background-color: #3b3b4d; -fx-text-fill: #c678dd; -fx-border-color: #c678dd; -fx-border-radius: 3;");
+        importBtn.setOnAction(e -> importConfigFromJson());
+        fileBar.getChildren().addAll(exportBtn, importBtn);
+
+        ioStatusLabel = new Label();
+        ioStatusLabel.setWrapText(true);
+        ioStatusLabel.setMaxWidth(300);
+        ioStatusLabel.setStyle("-fx-font-size: 11px;");
+
         hudLabel = new Label();
         hudLabel.setStyle("-fx-text-fill: #d0d0d0; -fx-font-family: monospace; -fx-font-size: 11px;");
         VBox hudBox = new VBox(hudLabel);
@@ -434,6 +519,8 @@ public class MobileRobotTestApp extends Application {
                 teleopLabel, teleopVRow, teleopOmegaRow, stopBtn, cameraToggleBtn, hintLabel,
                 new Separator(),
                 resetBtn, selfTestBtn, selfTestLabel,
+                new Separator(),
+                fileLabel, fileBar, ioStatusLabel,
                 new Separator(),
                 hudBox
         );
