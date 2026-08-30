@@ -1,5 +1,6 @@
 package com.example.dhparameterfx;
 
+import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -49,7 +50,14 @@ public class MobileRobotConfigIO {
      *   "maxWheelSpeedRadPerSec": 6.0000, "pose": { "x": 0.0000, "y": 0.0000, "thetaDeg": 0.0000 } }}
      */
     public static String toJson(MobileRobotConfig config) {
-        return String.format(
+        // Locale.US is required here, not cosmetic: String.format is
+        // locale-sensitive, and on machines whose default locale uses a
+        // comma as the decimal separator (common outside the US), an
+        // unqualified "%.4f" silently emits "1,2500" instead of "1.2500".
+        // requireDouble()'s regex only recognizes a literal '.' as the
+        // decimal point, so on such a machine it would parse only the
+        // integer part and silently drop the fraction (1.25 -> 1.0).
+        return String.format(Locale.US,
                 "{\n" +
                         "  \"type\": \"differential_drive\",\n" +
                         "  \"wheelRadius\": %.4f,\n" +
