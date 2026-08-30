@@ -15,6 +15,7 @@
     </properties>
 
     <dependencies>
+
         <dependency>
             <groupId>org.openjfx</groupId>
             <artifactId>javafx-controls</artifactId>
@@ -123,7 +124,36 @@
                     <source>21</source>
                     <target>21</target>
                     <compilerArgs>--enable-preview</compilerArgs>
+                    <!--
+                        This project has a module-info.java (implied by the
+                        javafx-maven-plugin's module-qualified mainClass
+                        below), so by default the compiler plugin also tries
+                        to compile src/test/java on the MODULE path. JUnit 5
+                        is only declared as a test-scope dependency and isn't
+                        required by module-info.java, so the module system
+                        hides it from test compilation entirely, producing
+                        "package org.junit.jupiter.api does not exist" even
+                        though it's on the classpath. Forcing test
+                        compilation onto the plain classpath avoids that.
+                    -->
+                    <testRelease>21</testRelease>
+                    <useModulePath>false</useModulePath>
                 </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+                <!--
+                    Needed so `mvn test` actually discovers and runs the
+                    JUnit 5 (Jupiter) tests, e.g. DifferentialDriveKinematicsTest
+                    and MobileRobotConfigIOTest. The plugin auto-detects the
+                    JUnit Platform once junit-jupiter-engine is on the test
+                    classpath (already declared above) - this just pins a
+                    modern-enough Surefire version to make sure that
+                    detection actually works, since Maven's default bundled
+                    Surefire can be too old to see JUnit 5 tests at all.
+                -->
             </plugin>
             <plugin>
                 <groupId>org.openjfx</groupId>
