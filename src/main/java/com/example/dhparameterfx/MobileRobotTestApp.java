@@ -135,23 +135,32 @@ public class MobileRobotTestApp extends Application {
         double r = robot.getWheelRadius() * SCALE / 10.0;
         double trackW = robot.getTrackWidth() * SCALE / 10.0;
 
-        Box chassis = new Box(trackW * 0.9, r * 0.6, r * 2.2);
+        // Local-frame convention (must match updateRobotVisualTransform()):
+        // forward = local +X, left/right (track width) = local +/-Z.
+        // Previously this method built forward along +Z while the rotation
+        // transform assumed +X, which rotated the visible heading 90 degrees
+        // away from the direction the robot actually integrates toward —
+        // that mismatch is what produced the sideways-sliding look.
+        Box chassis = new Box(r * 2.2, r * 0.6, trackW * 0.9);
         chassis.setMaterial(new PhongMaterial(Color.web("#61afef")));
         chassis.setTranslateY(-r * 0.3);
 
+        // Wheel axle must run along local Z (perpendicular to forward/+X),
+        // so rotate the cylinder's default Y-axis onto Z via a 90 deg
+        // rotation about X, not Z.
         Cylinder leftWheel = new Cylinder(r, r * 0.5);
         leftWheel.setMaterial(new PhongMaterial(Color.web("#3b3b4d")));
-        leftWheel.getTransforms().add(new Rotate(90, Rotate.Z_AXIS));
-        leftWheel.setTranslateX(-trackW / 2.0);
+        leftWheel.getTransforms().add(new Rotate(90, Rotate.X_AXIS));
+        leftWheel.setTranslateZ(-trackW / 2.0);
 
         Cylinder rightWheel = new Cylinder(r, r * 0.5);
         rightWheel.setMaterial(new PhongMaterial(Color.web("#3b3b4d")));
-        rightWheel.getTransforms().add(new Rotate(90, Rotate.Z_AXIS));
-        rightWheel.setTranslateX(trackW / 2.0);
+        rightWheel.getTransforms().add(new Rotate(90, Rotate.X_AXIS));
+        rightWheel.setTranslateZ(trackW / 2.0);
 
-        Box headingArrow = new Box(r * 0.25, r * 0.25, r * 1.4);
+        Box headingArrow = new Box(r * 1.4, r * 0.25, r * 0.25);
         headingArrow.setMaterial(new PhongMaterial(Color.web("#e06c75")));
-        headingArrow.setTranslateZ(r * 1.6);
+        headingArrow.setTranslateX(r * 1.6);
         headingArrow.setTranslateY(-r * 0.3);
 
         robotVisual.getChildren().addAll(chassis, leftWheel, rightWheel, headingArrow);
