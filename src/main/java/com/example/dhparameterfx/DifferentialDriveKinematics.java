@@ -34,7 +34,10 @@ public class DifferentialDriveKinematics {
         }
     }
 
+    // ---------------------------------------------------------------
     // Forward kinematics: wheel speeds -> body velocity
+    // ---------------------------------------------------------------
+
     /**
      * Standard differential-drive forward kinematics.
      * v     = r * (omegaR + omegaL) / 2
@@ -48,7 +51,10 @@ public class DifferentialDriveKinematics {
         return new BodyVelocity(v, omega);
     }
 
+    // ---------------------------------------------------------------
     // Inverse kinematics: desired body velocity -> wheel speeds
+    // ---------------------------------------------------------------
+
     /**
      * Inverts the forward kinematics above:
      * omegaL = (v - omega*L/2) / r
@@ -78,21 +84,20 @@ public class DifferentialDriveKinematics {
         return computeWheelSpeeds(v, omega, chassis).clamped(chassis.maxWheelSpeedRadPerSec());
     }
 
+    // ---------------------------------------------------------------
     // Pose integration (unicycle model, exact arc solution)
-    private static final double OMEGA_EPSILON = 1e-6;
+    // ---------------------------------------------------------------
 
     /**
      * Integrates the unicycle model exactly over dt seconds, rather than
      * with a first-order Euler step, so a constant (v, omega) command
      * traces a true circular arc with no accumulated curvature error.
      * <p>
-     * Straight-line case (|omega| ~ 0):
-     *   x' = x + v*dt*cos(theta),  y' = y + v*dt*sin(theta),  theta' = theta
-     * <p>
-     * Constant-curvature case:
-     *   theta' = theta + omega*dt
-     *   x'     = x + (v/omega) * (sin(theta') - sin(theta))
-     *   y'     = y - (v/omega) * (cos(theta') - cos(theta))
+     * The actual arc math lives in {@link UnicyclePoseIntegrator}, shared
+     * with {@code AckermannKinematics} — once (v, omega) is known, pose
+     * evolves identically regardless of chassis type. This method exists
+     * as a thin instance-method wrapper so existing call sites and tests
+     * keep working unchanged.
      * <p>
      * This is also the closed-form the self-test / HUD should check against
      * when validating straight-line and pure-rotation motion, analogous to
@@ -100,18 +105,7 @@ public class DifferentialDriveKinematics {
      * against known elementary-matrix candidates.
      */
     public Pose2D integrate(Pose2D pose, double v, double omega, double dt) {
-        double theta = pose.thetaRad();
-
-        if (Math.abs(omega) < OMEGA_EPSILON) {
-            double x = pose.x() + v * dt * Math.cos(theta);
-            double y = pose.y() + v * dt * Math.sin(theta);
-            return new Pose2D(x, y, pose.thetaDeg());
-        }
-
-        double thetaNext = theta + omega * dt;
-        double x = pose.x() + (v / omega) * (Math.sin(thetaNext) - Math.sin(theta));
-        double y = pose.y() - (v / omega) * (Math.cos(thetaNext) - Math.cos(theta));
-        return new Pose2D(x, y, Math.toDegrees(thetaNext));
+        return UnicyclePoseIntegrator.integrate(pose, v, omega, dt);
     }
 
     /**
@@ -124,7 +118,10 @@ public class DifferentialDriveKinematics {
         return integrate(pose, bv.v(), bv.omega(), dt);
     }
 
+    // ---------------------------------------------------------------
     // Nonholonomic constraint helper
+    // ---------------------------------------------------------------
+
     /**
      * A differential-drive (or Ackermann) base can never realize instantaneous
      * lateral (sideways, body-frame +y) motion — that is precisely what
@@ -136,11 +133,11 @@ public class DifferentialDriveKinematics {
      *
      * @return true always, for this drive type — included so UI code has a
      *         single, self-documenting call site to gate strafe-style
-     *         controls, and so a future OmniKinematics/AckermannKinematics
-     *         class can override with real per-platform logic.
+     *         controls. {@link AckermannKinematics#isPivotTurnAchievable}
+     *         is the analogous method for that drive type's own constraint
+     *         (no in-place rotation, rather than no lateral motion).
      */
     public boolean isLateralMotionAchievable() {
         return false;
-
     }
 }

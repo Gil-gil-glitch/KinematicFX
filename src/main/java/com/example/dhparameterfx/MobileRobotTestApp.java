@@ -43,11 +43,24 @@ public class MobileRobotTestApp extends Application {
 
     private static final double SCALE = 20.0; // world units per pose unit
 
+    private enum DriveType { DIFFERENTIAL, ACKERMANN }
+    private DriveType driveType = DriveType.DIFFERENTIAL;
+
     private final MobileRobotModel robot = new MobileRobotModel(1.0, 3.0, 6.0);
+    private final AckermannRobotModel ackermann = new AckermannRobotModel(6.0, 3.5, 35.0, 10.0);
+
+    /** Returns whichever model is currently driving the sim, so the animation loop, HUD, camera, etc. don't branch on drive type themselves. */
+    private PlanarRobotModel activeModel() {
+        return driveType == DriveType.DIFFERENTIAL ? robot : ackermann;
+    }
 
     private final Group world = new Group();
     private final Group robotVisual = new Group();
     private final Group robotGeometryGroup = new Group();
+    private final Group ackermannVisual = new Group();
+    private final Group ackermannGeometryGroup = new Group();
+    private Group frontLeftPivot;
+    private Group frontRightPivot;
     private final Group trailGroup = new Group();
     private Box floorPlane;
 
@@ -107,6 +120,10 @@ public class MobileRobotTestApp extends Application {
         buildRobotVisual();
         robotVisual.getChildren().add(robotGeometryGroup);
 
+        buildAckermannVisual();
+        ackermannVisual.getChildren().add(ackermannGeometryGroup);
+        ackermannVisual.setVisible(false); // driveType starts as DIFFERENTIAL
+
         fpvCamera = new PerspectiveCamera(true);
         fpvCamera.setNearClip(0.05);
         fpvCamera.setFarClip(2000);
@@ -115,9 +132,8 @@ public class MobileRobotTestApp extends Application {
         // looks down local +X, which is this robot's forward axis (see the
         // convention note in buildRobotVisual/updateRobotVisualTransform).
         fpvCamera.getTransforms().add(new Rotate(90, Rotate.Y_AXIS));
-        fpvCamera.setTranslateX(robot.getWheelRadius() * SCALE / 10.0 * 0.6);
-        fpvCamera.setTranslateY(-robot.getWheelRadius() * SCALE / 10.0 * 1.6);
-        robotVisual.getChildren().add(fpvCamera);
+        robotVisual.getChildren().add(fpvCamera); // starts under the active (differential) visual
+        repositionFpvCamera();
 
         // Top-down preset: a bird's-eye view for judging the driven trail
         // and planned path against each other, and for keeping the whole
@@ -138,6 +154,7 @@ public class MobileRobotTestApp extends Application {
         world.getChildren().add(topDownCamera);
 
         world.getChildren().add(robotVisual);
+        world.getChildren().add(ackermannVisual);
 
         AmbientLight ambient = new AmbientLight(Color.color(0.45, 0.45, 0.45));
         PointLight light = new PointLight(Color.WHITE);
@@ -288,12 +305,136 @@ public class MobileRobotTestApp extends Application {
         robotGeometryGroup.getChildren().addAll(chassis, leftWheel, rightWheel, headingArrow);
     }
 
-    /** Re-derives the FPV camera's mount offset from the current wheel radius. */
+    /**
+     * Builds the Ackermann chassis: a longer body (scaled from wheelbase
+     * rather than wheel radius, since wheelbase is what actually varies for
+     * this drive type), two fixed rear wheels, and two front wheels each
+     * mounted on their own pivot {@link Group} so {@link #updateAckermannSteering}
+     * can rotate them independently every frame without touching the rest
+     * of the geometry. Same local-frame convention as {@link #buildRobotVisual}:
+     * forward = local +X, left/right = local +/-Z.
+     */
+    private void buildAckermannVisual() {
+        ackermannGeometryGroup.getChildren().clear();
+
+        double r = ackermann.getWheelRadius() * SCALE / 10.0;
+        double wb = ackermann.getWheelbase() * SCALE / 10.0;
+        double trackW = ackermann.getTrackWidth() * SCALE / 10.0;
+
+        // Local +Z is verified to be this app's true "left" direction under
+        // the Rotate(-thetaDeg, Y_AXIS) chassis-heading convention (left
+        // wheels placed at +trackW/2, right wheels at -trackW/2). This
+        // matters here — unlike buildRobotVisual's cosmetic left/right
+        // wheel naming, which is harmless since diff-drive wheels aren't
+        // independently animated — because getLeftFrontWheelAngleDeg() vs
+        // getRightFrontWheelAngleDeg() must land on the geometrically
+        // correct side or a left turn would visibly toe in the wrong wheel.
+
+        Box chassis = new Box(wb * 1.15, r * 0.6, trackW * 0.85);
+        chassis.setMaterial(new PhongMaterial(Color.web("#e5c07b")));
+        chassis.setTranslateY(-r * 0.3);
+
+        Cylinder rearLeft = new Cylinder(r, r * 0.5);
+        rearLeft.setMaterial(new PhongMaterial(Color.web("#3b3b4d")));
+        rearLeft.getTransforms().add(new Rotate(90, Rotate.X_AXIS));
+        rearLeft.setTranslateX(-wb / 2.0);
+        rearLeft.setTranslateZ(trackW / 2.0);
+
+        Cylinder rearRight = new Cylinder(r, r * 0.5);
+        rearRight.setMaterial(new PhongMaterial(Color.web("#3b3b4d")));
+        rearRight.getTransforms().add(new Rotate(90, Rotate.X_AXIS));
+        rearRight.setTranslateX(-wb / 2.0);
+        rearRight.setTranslateZ(-trackW / 2.0);
+
+        Cylinder frontLeftWheel = new Cylinder(r, r * 0.5);
+        frontLeftWheel.setMaterial(new PhongMaterial(Color.web("#3b3b4d")));
+        frontLeftWheel.getTransforms().add(new Rotate(90, Rotate.X_AXIS));
+        frontLeftPivot = new Group(frontLeftWheel);
+        frontLeftPivot.setTranslateX(wb / 2.0);
+        frontLeftPivot.setTranslateZ(trackW / 2.0);
+
+        Cylinder frontRightWheel = new Cylinder(r, r * 0.5);
+        frontRightWheel.setMaterial(new PhongMaterial(Color.web("#3b3b4d")));
+        frontRightWheel.getTransforms().add(new Rotate(90, Rotate.X_AXIS));
+        frontRightPivot = new Group(frontRightWheel);
+        frontRightPivot.setTranslateX(wb / 2.0);
+        frontRightPivot.setTranslateZ(-trackW / 2.0);
+
+        Box headingArrow = new Box(wb * 0.3, r * 0.25, r * 0.25);
+        headingArrow.setMaterial(new PhongMaterial(Color.web("#e06c75")));
+        headingArrow.setTranslateX(wb / 2.0 + r * 1.2);
+        headingArrow.setTranslateY(-r * 0.3);
+
+        ackermannGeometryGroup.getChildren().addAll(
+                chassis, rearLeft, rearRight, frontLeftPivot, frontRightPivot, headingArrow);
+    }
+
+    /**
+     * Applies the current per-wheel Ackermann steering angles (from
+     * {@link AckermannRobotModel}) to the front-wheel pivot groups. Called
+     * every frame while Ackermann is active — cheap (just two rotation
+     * updates), unlike {@link #buildAckermannVisual} which rebuilds meshes
+     * and should only run when chassis geometry actually changes.
+     */
+    private void updateAckermannSteering() {
+        if (frontLeftPivot == null || frontRightPivot == null) return;
+        // Steering rotates about the vertical (world-up) axis, which after
+        // the ground-plane convention established elsewhere is world Y —
+        // same axis used for the whole-chassis heading rotation.
+        frontLeftPivot.getTransforms().setAll(new Rotate(-ackermann.getLeftFrontWheelAngleDeg(), Rotate.Y_AXIS));
+        frontRightPivot.getTransforms().setAll(new Rotate(-ackermann.getRightFrontWheelAngleDeg(), Rotate.Y_AXIS));
+    }
+
+    private void updateAckermannVisualTransform() {
+        Pose2D pose = ackermann.getPose();
+        ackermannVisual.getTransforms().clear();
+        ackermannVisual.getTransforms().add(new Translate(pose.x() * SCALE, 0, pose.y() * SCALE));
+        ackermannVisual.getTransforms().add(new Rotate(-pose.thetaDeg(), Rotate.Y_AXIS));
+    }
+
+    /** Re-derives the FPV camera's mount offset for whichever drive type is currently active. */
     private void repositionFpvCamera() {
         if (fpvCamera == null) return;
-        double r = robot.getWheelRadius() * SCALE / 10.0;
-        fpvCamera.setTranslateX(r * 0.6);
-        fpvCamera.setTranslateY(-r * 1.6);
+        if (driveType == DriveType.DIFFERENTIAL) {
+            double r = robot.getWheelRadius() * SCALE / 10.0;
+            fpvCamera.setTranslateX(r * 0.6);
+            fpvCamera.setTranslateY(-r * 1.6);
+        } else {
+            double r = ackermann.getWheelRadius() * SCALE / 10.0;
+            double wb = ackermann.getWheelbase() * SCALE / 10.0;
+            // Mount near the front of the (longer) Ackermann chassis rather
+            // than at its center, closer to where a driver's seat would be.
+            fpvCamera.setTranslateX(wb * 0.25);
+            fpvCamera.setTranslateY(-r * 1.8);
+        }
+    }
+
+    /**
+     * Switches the active drive type: swaps which visual is shown, moves
+     * the FPV camera to the newly active chassis, resets both models to the
+     * origin, and clears the trail/path — pose is deliberately not carried
+     * over between drive types (they have different kinematics entirely, so
+     * "continuing from where the other one was" isn't a meaningful state to
+     * preserve) rather than attempting a lossy pose translation.
+     */
+    private void switchDriveType(DriveType newType) {
+        if (newType == driveType) return;
+
+        Group oldVisual = driveType == DriveType.DIFFERENTIAL ? robotVisual : ackermannVisual;
+        Group newVisual = newType == DriveType.DIFFERENTIAL ? robotVisual : ackermannVisual;
+
+        oldVisual.getChildren().remove(fpvCamera);
+        newVisual.getChildren().add(fpvCamera);
+
+        driveType = newType;
+        robotVisual.setVisible(driveType == DriveType.DIFFERENTIAL);
+        ackermannVisual.setVisible(driveType == DriveType.ACKERMANN);
+
+        activeModel().setPose(Pose2D.origin());
+        trailGroup.getChildren().clear();
+        clearPath();
+        repositionFpvCamera();
+        updateHud();
     }
 
     private void updateRobotVisualTransform() {
@@ -304,7 +445,7 @@ public class MobileRobotTestApp extends Application {
     }
 
     private void addTrailMarker() {
-        Pose2D pose = robot.getPose();
+        Pose2D pose = activeModel().getPose();
         Sphere dot = new Sphere(0.6);
         dot.setMaterial(new PhongMaterial(Color.web("#98c379")));
         dot.setTranslateX(pose.x() * SCALE);
@@ -378,7 +519,7 @@ public class MobileRobotTestApp extends Application {
 
                 if (followingPath && !path.isEmpty()) {
                     PurePursuitController.Command cmd = pathController.computeCommand(
-                            robot.getPose(), path, pathTargetIndex,
+                            activeModel().getPose(), path, pathTargetIndex,
                             LOOKAHEAD_DISTANCE, PATH_DESIRED_SPEED, PATH_GOAL_TOLERANCE);
                     v = cmd.v();
                     omega = cmd.omega();
@@ -391,11 +532,16 @@ public class MobileRobotTestApp extends Application {
                     omega = teleopOmega.getValue();
                 }
 
-                robot.step(v, omega, dt);
-                updateRobotVisualTransform();
+                activeModel().step(v, omega, dt);
+                if (driveType == DriveType.DIFFERENTIAL) {
+                    updateRobotVisualTransform();
+                } else {
+                    updateAckermannVisualTransform();
+                    updateAckermannSteering();
+                }
 
                 if (cameraMode == CameraMode.TOP_DOWN) {
-                    Pose2D pose = robot.getPose();
+                    Pose2D pose = activeModel().getPose();
                     topDownCamera.setTranslateX(pose.x() * SCALE);
                     topDownCamera.setTranslateZ(pose.y() * SCALE);
                 }
@@ -412,16 +558,24 @@ public class MobileRobotTestApp extends Application {
     }
 
     private void updateHud() {
-        Pose2D pose = robot.getPose();
+        Pose2D pose = activeModel().getPose();
         String mode = followingPath
                 ? String.format("following path (waypoint %d/%d)", pathTargetIndex + 1, path.size())
                 : "teleop";
+
+        String driveSpecificLine = driveType == DriveType.DIFFERENTIAL
+                ? String.format("wheel L: %5.2f rad/s   wheel R: %5.2f rad/s", robot.getLeftWheelSpeed(), robot.getRightWheelSpeed())
+                : String.format("steering: %5.1f deg   (front L %5.1f / R %5.1f deg)",
+                ackermann.getSteeringAngleDeg(), ackermann.getLeftFrontWheelAngleDeg(), ackermann.getRightFrontWheelAngleDeg());
+
         hudLabel.setText(String.format(
-                "x: %6.2f   y: %6.2f   theta: %6.1f deg%n" +
-                        "wheel L: %5.2f rad/s   wheel R: %5.2f rad/s%n" +
+                "drive: %s%n" +
+                        "x: %6.2f   y: %6.2f   theta: %6.1f deg%n" +
+                        "%s%n" +
                         "mode: %s",
+                driveType == DriveType.DIFFERENTIAL ? "differential" : "ackermann",
                 pose.x(), pose.y(), pose.thetaDeg(),
-                robot.getLeftWheelSpeed(), robot.getRightWheelSpeed(),
+                driveSpecificLine,
                 mode
         ));
     }
@@ -467,16 +621,53 @@ public class MobileRobotTestApp extends Application {
         }
         double arcDrift = Math.hypot(arcPose.x() - arcStart.x(), arcPose.y() - arcStart.y());
 
-        if (worst < 1e-9 && posDrift < 1e-9 && arcDrift < 1e-3) {
+        // Ackermann checks, run alongside the differential-drive ones above
+        // regardless of which drive type is currently active in the viewport
+        // — this validates both engines every time, not just whichever one
+        // happens to be on screen.
+        AckermannKinematics ak = new AckermannKinematics();
+        AckermannKinematics.Chassis akChassis = new AckermannKinematics.Chassis(
+                ackermann.getWheelbase(), ackermann.getTrackWidth(),
+                Math.toRadians(ackermann.getMaxSteeringAngleDeg()), 1000.0); // huge speed cap: test the math, not clamping
+
+        double akWorst = 0.0;
+        for (double omega : new double[]{0.0, 0.3, -0.3, 0.6}) {
+            double delta = ak.computeSteeringAngle(6.0, omega, akChassis);
+            AckermannKinematics.BodyVelocity back = ak.computeBodyVelocity(6.0, delta, akChassis);
+            akWorst = Math.max(akWorst, Math.abs(back.omega() - omega));
+        }
+
+        // The defining Ackermann constraint: v=0 must yield omega=0 for any requested turn.
+        boolean pivotCorrectlyBlocked = Math.abs(ak.computeBodyVelocity(0.0,
+                ak.computeSteeringAngle(0.0, 2.0, akChassis), akChassis).omega()) < 1e-9;
+
+        double akArcV = 3.0;
+        double akDelta = Math.toRadians(15);
+        AckermannKinematics.BodyVelocity akBv = ak.computeBodyVelocity(akArcV, akDelta, akChassis);
+        double akPeriod = 2 * Math.PI / akBv.omega();
+        Pose2D akPose = Pose2D.origin();
+        int akSteps = 720;
+        double akDt = akPeriod / akSteps;
+        for (int i = 0; i < akSteps; i++) {
+            akPose = ak.integrate(akPose, akBv.v(), akBv.omega(), akDt);
+        }
+        double akArcDrift = Math.hypot(akPose.x(), akPose.y());
+
+        boolean diffOk = worst < 1e-9 && posDrift < 1e-9 && arcDrift < 1e-3;
+        boolean ackermannOk = akWorst < 1e-6 && pivotCorrectlyBlocked && akArcDrift < 1e-3;
+
+        if (diffOk && ackermannOk) {
             selfTestLabel.setText(String.format(
-                    "\u2713 Round-trip OK (err %.2e), pure rotation has zero drift, " +
-                            "and a full-circle arc closes within %.4f units.",
-                    worst, arcDrift));
+                    "\u2713 Both engines OK — diff-drive round-trip %.2e / arc closes within %.4f; " +
+                            "Ackermann round-trip %.2e, v=0 pivot correctly blocked, arc closes within %.4f.",
+                    worst, arcDrift, akWorst, akArcDrift));
             selfTestLabel.setStyle("-fx-text-fill: #98c379; -fx-font-size: 11px; -fx-font-weight: bold;");
         } else {
             selfTestLabel.setText(String.format(
-                    "\u26A0 Round-trip error %.2e, rotation drift %.2e, arc-closure drift %.4f — check kinematics signs/units.",
-                    worst, posDrift, arcDrift));
+                    "\u26A0 diff-drive: round-trip %.2e, rotation drift %.2e, arc drift %.4f (%s). " +
+                            "Ackermann: round-trip %.2e, pivot blocked=%s, arc drift %.4f (%s).",
+                    worst, posDrift, arcDrift, diffOk ? "OK" : "FAIL",
+                    akWorst, pivotCorrectlyBlocked, akArcDrift, ackermannOk ? "OK" : "FAIL"));
             selfTestLabel.setStyle("-fx-text-fill: #e5c07b; -fx-font-size: 11px; -fx-font-weight: bold;");
         }
     }
@@ -497,6 +688,10 @@ public class MobileRobotTestApp extends Application {
     // ---------------------------------------------------------------
 
     private void exportConfigToJson() {
+        if (driveType != DriveType.DIFFERENTIAL) {
+            setIoStatus("Export/import currently only supports differential-drive configs — Ackermann persistence isn't built yet.", false);
+            return;
+        }
         FileChooser fileChooser = new FileChooser();
         fileChooser.setTitle("Export Mobile Robot Config to JSON");
         fileChooser.getExtensionFilters().add(new FileChooser.ExtensionFilter("JSON Files (*.json)", "*.json"));
@@ -515,6 +710,10 @@ public class MobileRobotTestApp extends Application {
     }
 
     private void importConfigFromJson() {
+        if (driveType != DriveType.DIFFERENTIAL) {
+            setIoStatus("Export/import currently only supports differential-drive configs — Ackermann persistence isn't built yet.", false);
+            return;
+        }
         FileChooser fileChooser = new FileChooser();
         fileChooser.setTitle("Import Mobile Robot Config from JSON");
         fileChooser.getExtensionFilters().add(new FileChooser.ExtensionFilter("JSON Files (*.json)", "*.json"));
@@ -551,31 +750,81 @@ public class MobileRobotTestApp extends Application {
     private Slider teleopV;
     private Slider teleopOmega;
 
+    private Label headerLabel;
+    private VBox diffChassisBox;
+    private VBox ackermannChassisBox;
+
     private VBox buildControlPanel() {
         VBox panel = new VBox(10);
         panel.setPrefWidth(340);
         panel.setPadding(new Insets(15));
         panel.setStyle("-fx-background-color: #2b2b36;");
 
-        Label header = new Label("Mobile Robot (Differential Drive)");
-        header.setStyle("-fx-font-size: 15px; -fx-font-weight: bold; -fx-text-fill: white;");
+        headerLabel = new Label("Mobile Robot (Differential Drive)");
+        headerLabel.setStyle("-fx-font-size: 15px; -fx-font-weight: bold; -fx-text-fill: white;");
 
-        Label chassisLabel = new Label("Chassis geometry:");
-        chassisLabel.setStyle("-fx-font-size: 11px; -fx-text-fill: #abb2bf; -fx-font-weight: bold;");
+        // --- Drive-type switcher ---
+        Label driveTypeLabel = new Label("Drive type:");
+        driveTypeLabel.setStyle("-fx-font-size: 11px; -fx-text-fill: #abb2bf; -fx-font-weight: bold;");
+
+        ToggleGroup driveTypeGroup = new ToggleGroup();
+        RadioButton diffRadio = new RadioButton("Differential drive");
+        RadioButton ackermannRadio = new RadioButton("Ackermann steering");
+        diffRadio.setToggleGroup(driveTypeGroup);
+        ackermannRadio.setToggleGroup(driveTypeGroup);
+        diffRadio.setSelected(true);
+        diffRadio.setStyle("-fx-text-fill: #abb2bf; -fx-font-size: 12px;");
+        ackermannRadio.setStyle("-fx-text-fill: #abb2bf; -fx-font-size: 12px;");
+        HBox driveTypeRow = new HBox(15, diffRadio, ackermannRadio);
+
+        // --- Differential-drive chassis section ---
+        Label diffChassisLabel = new Label("Chassis geometry:");
+        diffChassisLabel.setStyle("-fx-font-size: 11px; -fx-text-fill: #abb2bf; -fx-font-weight: bold;");
 
         HBox wheelRadiusRow = boundSliderRow("Wheel radius:", 0.3, 3.0, robot.wheelRadiusProperty());
         HBox trackWidthRow = boundSliderRow("Track width:", 1.0, 8.0, robot.trackWidthProperty());
         HBox maxSpeedRow = boundSliderRow("Max wheel speed:", 1.0, 15.0, robot.maxWheelSpeedRadPerSecProperty());
 
-        wheelRadiusRow.getChildren().get(1).setOnMouseReleased(e -> buildRobotVisual());
-        // Rebuild the visual whenever geometry properties change, not just on release.
         robot.wheelRadiusProperty().addListener((o, ov, nv) -> {
             buildRobotVisual();
-            repositionFpvCamera();
+            if (driveType == DriveType.DIFFERENTIAL) repositionFpvCamera();
         });
         robot.trackWidthProperty().addListener((o, ov, nv) -> buildRobotVisual());
 
-        Label teleopLabel = new Label("Teleop (used when not driving to a target):");
+        diffChassisBox = new VBox(6, diffChassisLabel, wheelRadiusRow, trackWidthRow, maxSpeedRow);
+
+        // --- Ackermann chassis section ---
+        Label akChassisLabel = new Label("Chassis geometry:");
+        akChassisLabel.setStyle("-fx-font-size: 11px; -fx-text-fill: #abb2bf; -fx-font-weight: bold;");
+
+        HBox wheelbaseRow = boundSliderRow("Wheelbase:", 2.0, 12.0, ackermann.wheelbaseProperty());
+        HBox akTrackWidthRow = boundSliderRow("Track width:", 1.0, 6.0, ackermann.trackWidthProperty());
+        HBox maxSteerRow = boundSliderRow("Max steering angle (deg):", 10.0, 45.0, ackermann.maxSteeringAngleDegProperty());
+        HBox akMaxSpeedRow = boundSliderRow("Max speed:", 1.0, 20.0, ackermann.maxSpeedProperty());
+
+        ackermann.wheelbaseProperty().addListener((o, ov, nv) -> {
+            buildAckermannVisual();
+            if (driveType == DriveType.ACKERMANN) repositionFpvCamera();
+        });
+        ackermann.trackWidthProperty().addListener((o, ov, nv) -> buildAckermannVisual());
+
+        ackermannChassisBox = new VBox(6, akChassisLabel, wheelbaseRow, akTrackWidthRow, maxSteerRow, akMaxSpeedRow);
+        ackermannChassisBox.setManaged(false);
+        ackermannChassisBox.setVisible(false);
+
+        driveTypeGroup.selectedToggleProperty().addListener((o, ov, nv) -> {
+            boolean isAckermann = nv == ackermannRadio;
+            switchDriveType(isAckermann ? DriveType.ACKERMANN : DriveType.DIFFERENTIAL);
+
+            diffChassisBox.setVisible(!isAckermann);
+            diffChassisBox.setManaged(!isAckermann);
+            ackermannChassisBox.setVisible(isAckermann);
+            ackermannChassisBox.setManaged(isAckermann);
+
+            headerLabel.setText(isAckermann ? "Mobile Robot (Ackermann Steering)" : "Mobile Robot (Differential Drive)");
+        });
+
+        Label teleopLabel = new Label("Teleop (used when not following a path):");
         teleopLabel.setStyle("-fx-font-size: 11px; -fx-text-fill: #abb2bf; -fx-font-weight: bold;");
 
         teleopV = new Slider(-8, 8, 0);
@@ -615,7 +864,7 @@ public class MobileRobotTestApp extends Application {
                 // views doesn't briefly show wherever the camera was last
                 // parked (e.g. the origin, if the robot has since driven
                 // away from it).
-                Pose2D pose = robot.getPose();
+                Pose2D pose = activeModel().getPose();
                 topDownCamera.setTranslateX(pose.x() * SCALE);
                 topDownCamera.setTranslateZ(pose.y() * SCALE);
             }
@@ -628,7 +877,8 @@ public class MobileRobotTestApp extends Application {
         });
 
         Label hintLabel = new Label("Click the floor to queue a waypoint — following starts automatically, " +
-                "and further clicks extend the path (pure-pursuit curvature control, not point-and-snap).");
+                "and further clicks extend the path (pure-pursuit curvature control, not point-and-snap). " +
+                "Switching drive type resets pose, trail, and path.");
         hintLabel.setWrapText(true);
         hintLabel.setStyle("-fx-font-size: 11px; -fx-text-fill: #abb2bf;");
 
@@ -636,12 +886,12 @@ public class MobileRobotTestApp extends Application {
         resetBtn.setMaxWidth(Double.MAX_VALUE);
         resetBtn.setStyle("-fx-background-color: #3b3b4d; -fx-text-fill: #abb2bf; -fx-font-size: 11px;");
         resetBtn.setOnAction(e -> {
-            robot.setPose(Pose2D.origin());
+            activeModel().setPose(Pose2D.origin());
             trailGroup.getChildren().clear();
             clearPath();
         });
 
-        Button selfTestBtn = new Button("Run kinematics self-test");
+        Button selfTestBtn = new Button("Run kinematics self-test (both engines)");
         selfTestBtn.setMaxWidth(Double.MAX_VALUE);
         selfTestBtn.setStyle("-fx-background-color: #3b3b4d; -fx-text-fill: #abb2bf; -fx-font-size: 11px;");
         selfTestBtn.setOnAction(e -> runSelfTest());
@@ -678,8 +928,10 @@ public class MobileRobotTestApp extends Application {
         hudBox.setStyle("-fx-background-color: #21252b; -fx-padding: 8; -fx-background-radius: 5;");
 
         panel.getChildren().addAll(
-                header,
-                chassisLabel, wheelRadiusRow, trackWidthRow, maxSpeedRow,
+                headerLabel,
+                driveTypeLabel, driveTypeRow,
+                new Separator(),
+                diffChassisBox, ackermannChassisBox,
                 new Separator(),
                 teleopLabel, teleopVRow, teleopOmegaRow, stopBtn, cameraToggleBtn, hintLabel,
                 new Separator(),

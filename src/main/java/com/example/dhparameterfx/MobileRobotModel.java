@@ -14,7 +14,7 @@ import javafx.beans.property.SimpleDoubleProperty;
  * cylinders, heading indicator) and the click-to-drive / teleop control
  * panel are follow-up work once this core engine is in place.
  */
-public class MobileRobotModel {
+public class MobileRobotModel implements PlanarRobotModel {
 
     private final DifferentialDriveKinematics kinematics = new DifferentialDriveKinematics();
 
@@ -46,10 +46,12 @@ public class MobileRobotModel {
                 wheelRadius.get(), trackWidth.get(), maxWheelSpeedRadPerSec.get());
     }
 
+    @Override
     public Pose2D getPose() {
         return new Pose2D(x.get(), y.get(), thetaDeg.get());
     }
 
+    @Override
     public void setPose(Pose2D pose) {
         x.set(pose.x());
         y.set(pose.y());
@@ -63,11 +65,14 @@ public class MobileRobotModel {
      * velocity that was actually achievable after clamping — so, like
      * {@code runIKAndAnimate}'s per-frame reachability handling for the arm,
      * a request that exceeds hardware limits degrades gracefully instead of
-     * teleporting or diverging.
-     *
-     * @return the body velocity actually achieved this step, after clamping
+     * teleporting or diverging. The achieved wheel speeds are exposed via
+     * {@link #getLeftWheelSpeed()}/{@link #getRightWheelSpeed()} rather than
+     * a return value, so this matches {@link PlanarRobotModel#step}'s void
+     * signature and the app can drive either drive type through one
+     * interface reference.
      */
-    public DifferentialDriveKinematics.BodyVelocity step(double requestedV, double requestedOmega, double dt) {
+    @Override
+    public void step(double requestedV, double requestedOmega, double dt) {
         DifferentialDriveKinematics.Chassis c = chassis();
 
         WheelSpeeds commanded = kinematics.computeClampedWheelSpeeds(requestedV, requestedOmega, c);
@@ -76,7 +81,6 @@ public class MobileRobotModel {
 
         DifferentialDriveKinematics.BodyVelocity achieved = kinematics.computeBodyVelocity(commanded, c);
         setPose(kinematics.integrate(getPose(), achieved.v(), achieved.omega(), dt));
-        return achieved;
     }
 
     // --- Property accessors, mirroring DHParameterModel's getter/property pattern ---
